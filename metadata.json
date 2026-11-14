@@ -1,0 +1,11 @@
+{
+  "name": "Remix PalmStrike",
+  "description": "Top-down hand-tracked 4-player spinning laser arena with AI gun & level generation and Nano Banana arena textures.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
