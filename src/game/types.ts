@@ -94,6 +94,8 @@ export interface ArenaConfig {
   name: string;
   tagline: string;
   halfSize: number;
+  borderShapeName?: string;
+  borderPolygon?: Vec2[];
   palette: ArenaPalette;
   mutator: ArenaMutator;
   obstacles: ObstacleSpec[];

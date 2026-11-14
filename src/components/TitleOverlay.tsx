@@ -10,6 +10,7 @@ import {
   Layers,
   Mic,
   Play,
+  Shuffle,
   Sparkles,
   Users,
   Video,
@@ -50,7 +51,10 @@ interface TitleOverlayProps {
   onToggleCamera: () => void;
   onToggleSwapHands: () => void;
   onToggleVoice: () => void;
-  onGenerateArena: (theme: string) => Promise<string | undefined>;
+  onGenerateArena: (
+    theme: string,
+    options?: { generateTextures?: boolean; randomShape?: boolean },
+  ) => Promise<string | undefined>;
   onStartTutorial: () => void;
   onStartMatch: () => void;
   handOverlayRef: React.RefObject<HTMLCanvasElement | null>;
@@ -117,6 +121,64 @@ const GunBlueprintSvg: React.FC<{ gun: LaserGunConfig }> = ({ gun }) => {
   );
 };
 
+const ArenaBlueprintSvg: React.FC<{ arena: ArenaConfig }> = ({ arena }) => {
+  const half = arena.halfSize || 22;
+  const scale = 38 / half;
+  const cx = 44;
+  const cy = 44;
+  const poly = arena.borderPolygon;
+  const polyPoints =
+    poly && poly.length >= 3
+      ? poly
+          .map((pt) => `${(cx + pt.x * scale).toFixed(1)},${(cy + pt.z * scale).toFixed(1)}`)
+          .join(' ')
+      : `${cx - 38},${cy - 38} ${cx + 38},${cy - 38} ${cx + 38},${cy + 38} ${cx - 38},${cy + 38}`;
+
+  return (
+    <svg
+      viewBox="0 0 88 88"
+      className="w-20 h-20 shrink-0 rounded bg-slate-950 border border-slate-800"
+      aria-label={`Arena border blueprint: ${arena.borderShapeName || arena.name}`}
+    >
+      <polygon
+        points={polyPoints}
+        fill={arena.palette.floorPrimary || '#161f2e'}
+        stroke={arena.palette.accentGlow || '#38bdf8'}
+        strokeWidth="1.8"
+        strokeLinejoin="round"
+      />
+      {arena.obstacles.map((obs) => (
+        <rect
+          key={obs.id}
+          x={cx + (obs.x - obs.width * 0.5) * scale}
+          y={cy + (obs.z - obs.depth * 0.5) * scale}
+          width={Math.max(1.8, obs.width * scale)}
+          height={Math.max(1.8, obs.depth * scale)}
+          fill={obs.kind === 'monolith' ? arena.palette.accentGlow : arena.palette.wallPrimary}
+          opacity={obs.kind === 'monolith' ? 0.85 : 0.9}
+          rx="0.8"
+        />
+      ))}
+      {arena.spawnPoints.map((sp) => (
+        <circle
+          key={sp.index}
+          cx={cx + sp.x * scale}
+          cy={cy + sp.z * scale}
+          r="2.1"
+          fill={sp.color}
+        />
+      ))}
+    </svg>
+  );
+};
+
+const SHAPE_PRESET_PROMPTS = [
+  { label: 'Star Bastion', prompt: 'Five-pointed star fortress with central prism monolith' },
+  { label: 'Hourglass Rift', prompt: 'Hourglass lava canyon with narrow central choke' },
+  { label: 'Triangle Spire', prompt: 'Equilateral triangle obsidian temple with three corner pads' },
+  { label: 'Crescent Crater', prompt: 'Crescent moon asteroid crater with curved flank cover' },
+];
+
 export const TitleOverlay: React.FC<TitleOverlayProps> = ({
   playerName,
   onPlayerNameChange,
@@ -157,7 +219,10 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
   const [isForgingGun, setIsForgingGun] = useState(false);
   const [gunStatus, setGunStatus] = useState('');
 
-  const [arenaTheme, setArenaTheme] = useState('Obsidian Basalt Plasma Foundry');
+  const [arenaTheme, setArenaTheme] = useState(
+    'Five-pointed star obsidian foundry with sniper lanes',
+  );
+  const [genArenaTextures, setGenArenaTextures] = useState(true);
   const [isGeneratingArena, setIsGeneratingArena] = useState(false);
   const [arenaNote, setArenaNote] = useState('');
 
@@ -184,16 +249,25 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
     }
   };
 
-  const handleGenerateLevel = async () => {
-    if (!arenaTheme.trim()) {
-      setArenaNote('Enter an arena theme description first.');
+  const handleGenerateLevel = async (overridePrompt?: string, randomShape = false) => {
+    const promptToUse = (overridePrompt ?? arenaTheme).trim();
+    if (!randomShape && !promptToUse) {
+      setArenaNote('Describe a level layout or custom map border shape first.');
       return;
     }
     setIsGeneratingArena(true);
     setArenaNote('');
     try {
-      const warning = await onGenerateArena(arenaTheme.trim());
-      setArenaNote(warning || 'Generated AI level layout & Nano Banana arena textures.');
+      const warning = await onGenerateArena(promptToUse, {
+        generateTextures: genArenaTextures,
+        randomShape,
+      });
+      setArenaNote(
+        warning ||
+          (genArenaTextures
+            ? 'AI polygon level & Nano Banana textures generated.'
+            : 'AI custom-border level generated via LLM.'),
+      );
     } catch (err) {
       setArenaNote(err instanceof Error ? err.message : 'Arena generation failed');
     } finally {
@@ -277,10 +351,10 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
             </svg>
             <div>
               <h1 className="font-display text-3xl md:text-4xl font-bold tracking-tight text-white leading-none">
-                PALMSTRIKE
+                LASER PALM
               </h1>
               <p className="text-xs text-slate-300 mt-1">
-                Top-Down Spinning Laser Arena · 4-Player Rooms · Hand &amp; AI Forge
+                Top-Down Spinning Laser Arena · Webcam Face Avatar · AI Gun &amp; Level Forge
               </p>
             </div>
           </div>
@@ -396,7 +470,7 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
                 }`}
               >
                 <Layers className="w-3.5 h-3.5" />
-                <span>Level &amp; Textures</span>
+                <span>AI Level Gen</span>
               </button>
               <button
                 type="button"
@@ -482,81 +556,123 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
               </div>
             )}
 
-            {/* TAB 2: AI Level Layout & Nano Banana Arena Textures */}
+            {/* TAB 2: AI Polygon Level Generator & Nano Banana Arena Textures */}
             {activeTab === 'arena' && (
               <div className="flex flex-col gap-2.5">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="font-semibold text-white">{arena.name}</span>
-                  <span className="text-slate-400 truncate max-w-[260px]">
-                    {arena.obstacles.length} Obstacles · {arena.mutator.name}
-                  </span>
+                <div className="flex items-center gap-3">
+                  <ArenaBlueprintSvg arena={arena} />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-bold text-white truncate">{arena.name}</div>
+                    <div className="text-xs text-slate-400 line-clamp-1">{arena.tagline}</div>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs font-mono-num text-slate-200">
+                      <span data-testid="arena-border-shape" className="text-sky-300">
+                        {arena.borderShapeName || 'Polygon Border'} (
+                        {arena.borderPolygon?.length ?? 4}v)
+                      </span>
+                      <span className="text-slate-500">·</span>
+                      <span className="text-amber-300">{arena.obstacles.length} Obstacles</span>
+                    </div>
+                    <div className="text-[11px] text-slate-400 mt-0.5 truncate">
+                      Mutator: {arena.mutator.name}
+                    </div>
+                  </div>
                 </div>
 
                 <div className="flex items-center gap-2">
                   <input
                     type="text"
-                    aria-label="Describe arena level layout and Nano Banana texture theme"
+                    aria-label="Describe custom arena shape, level layout, and theme"
                     value={arenaTheme}
                     onChange={(e) => setArenaTheme(e.target.value)}
                     disabled={!isHost && Boolean(activeRoomCode)}
                     className="flex-1 px-3 py-1.5 text-xs bg-slate-900 border border-slate-700 rounded text-white focus:outline-none focus:border-sky-400 disabled:opacity-60"
-                    placeholder="Describe level theme & surface material..."
+                    placeholder="Any border shape & level (e.g. star fortress, crescent maze)..."
                   />
                   <button
                     type="button"
-                    onClick={handleGenerateLevel}
+                    onClick={() => void handleGenerateLevel(undefined, false)}
                     disabled={isGeneratingArena || (!isHost && Boolean(activeRoomCode))}
                     className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-sky-400 hover:bg-sky-300 disabled:opacity-50 text-slate-950 rounded transition-colors cursor-pointer whitespace-nowrap shrink-0"
                   >
                     <Sparkles className="w-3.5 h-3.5" />
-                    <span>
-                      {isGeneratingArena ? 'Generating...' : 'Generate Level & Textures'}
-                    </span>
+                    <span>{isGeneratingArena ? 'Building...' : 'Generate Level'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleGenerateLevel('', true)}
+                    disabled={isGeneratingArena || (!isHost && Boolean(activeRoomCode))}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold bg-amber-400/20 hover:bg-amber-400/30 disabled:opacity-50 border border-amber-400/70 text-amber-200 rounded transition-colors cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    <Shuffle className="w-3.5 h-3.5" />
+                    <span>Random AI Map</span>
                   </button>
                 </div>
 
-                <div className="flex items-center gap-3 pt-1">
-                  <div className="flex items-center gap-2 text-xs text-slate-300">
-                    {arena.floorTextureUrl ? (
-                      <img
-                        src={arena.floorTextureUrl}
-                        alt="Generated floor tile texture"
-                        referrerPolicy="no-referrer"
-                        className="w-9 h-9 rounded border border-slate-700 object-cover bg-slate-900"
-                      />
-                    ) : (
-                      <div className="w-9 h-9 rounded border border-slate-700 bg-slate-800 flex items-center justify-center text-[10px] text-slate-400">
-                        Tile
-                      </div>
-                    )}
-                    <div>
-                      <div className="font-medium text-slate-200">Floor Texture</div>
-                      <div className="text-[11px] text-slate-400">
-                        {arena.floorTextureUrl ? 'Nano Banana Custom' : 'Brushed Slate Default'}
-                      </div>
+                <div className="grid grid-cols-4 gap-1.5">
+                  {SHAPE_PRESET_PROMPTS.map((item) => (
+                    <button
+                      key={item.label}
+                      type="button"
+                      disabled={isGeneratingArena || (!isHost && Boolean(activeRoomCode))}
+                      onClick={() => {
+                        setArenaTheme(item.prompt);
+                        void handleGenerateLevel(item.prompt, false);
+                      }}
+                      className="py-1 px-2 text-[11px] font-medium rounded border bg-slate-900/80 border-slate-800 text-slate-300 hover:text-white hover:border-sky-400/60 transition-colors cursor-pointer whitespace-nowrap truncate disabled:opacity-50"
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800/80">
+                  <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-1.5 text-xs text-slate-300">
+                      {arena.floorTextureUrl ? (
+                        <img
+                          src={arena.floorTextureUrl}
+                          alt="Generated floor tile texture"
+                          referrerPolicy="no-referrer"
+                          className="w-7 h-7 rounded border border-slate-700 object-cover bg-slate-900"
+                        />
+                      ) : (
+                        <div className="w-7 h-7 rounded border border-slate-700 bg-slate-800 flex items-center justify-center text-[9px] text-slate-400">
+                          Tile
+                        </div>
+                      )}
+                      <span className="text-[11px] text-slate-400">
+                        {arena.floorTextureUrl ? 'AI Floor' : 'Default Floor'}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 text-xs text-slate-300">
+                      {arena.obstacleTextureUrl ? (
+                        <img
+                          src={arena.obstacleTextureUrl}
+                          alt="Generated obstacle wall texture"
+                          referrerPolicy="no-referrer"
+                          className="w-7 h-7 rounded border border-slate-700 object-cover bg-slate-900"
+                        />
+                      ) : (
+                        <div className="w-7 h-7 rounded border border-slate-700 bg-slate-800 flex items-center justify-center text-[9px] text-slate-400">
+                          Wall
+                        </div>
+                      )}
+                      <span className="text-[11px] text-slate-400">
+                        {arena.obstacleTextureUrl ? 'AI Cover' : 'Default Cover'}
+                      </span>
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2 text-xs text-slate-300">
-                    {arena.obstacleTextureUrl ? (
-                      <img
-                        src={arena.obstacleTextureUrl}
-                        alt="Generated obstacle wall texture"
-                        referrerPolicy="no-referrer"
-                        className="w-9 h-9 rounded border border-slate-700 object-cover bg-slate-900"
-                      />
-                    ) : (
-                      <div className="w-9 h-9 rounded border border-slate-700 bg-slate-800 flex items-center justify-center text-[10px] text-slate-400">
-                        Wall
-                      </div>
-                    )}
-                    <div>
-                      <div className="font-medium text-slate-200">Cover Texture</div>
-                      <div className="text-[11px] text-slate-400">
-                        {arena.obstacleTextureUrl ? 'Nano Banana Custom' : 'Alloy Plate Default'}
-                      </div>
-                    </div>
-                  </div>
+                  <label className="flex items-center gap-1.5 cursor-pointer text-[11px] text-slate-300 whitespace-nowrap">
+                    <input
+                      type="checkbox"
+                      checked={genArenaTextures}
+                      onChange={(e) => setGenArenaTextures(e.target.checked)}
+                      className="accent-sky-400"
+                    />
+                    <span>Nano Banana Textures</span>
+                  </label>
                 </div>
 
                 {arenaNote && <p className="text-xs text-sky-300">{arenaNote}</p>}
@@ -730,7 +846,7 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
             style={{ backgroundColor: 'rgba(13, 18, 28, 0.88)' }}
           >
             <h2 className="font-display text-sm font-bold text-white tracking-wide mb-2.5">
-              SPIN-LASER ARENA RULES
+              LASER PALM ARENA RULES
             </h2>
             <div className="space-y-2 text-xs text-slate-300">
               <div className="flex justify-between gap-3">
@@ -745,11 +861,15 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
                 <span className="text-amber-300 font-medium whitespace-nowrap">
                   R · {shootGesture.name}
                 </span>
-                <span className="text-right">Fire 1 laser pulse, then stop</span>
+                <span className="text-right">Sustained sweep pulse (0.34s)</span>
               </div>
               <div className="flex justify-between gap-3">
                 <span className="text-rose-300 font-medium whitespace-nowrap">3.0s Cooldown</span>
                 <span className="text-right">Dark overlay marks hand lock</span>
+              </div>
+              <div className="flex justify-between gap-3">
+                <span className="text-emerald-300 font-medium whitespace-nowrap">Hand Cam Face</span>
+                <span className="text-right">Webcam face cut into circle</span>
               </div>
               <div className="pt-1.5 mt-1.5 border-t border-slate-800 flex justify-between gap-3 text-[11px] text-slate-400">
                 <span>Inverse Range Law</span>

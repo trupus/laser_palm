@@ -7,6 +7,7 @@ import {
   createDefaultLaserGun,
   cyclePresetGun,
   evaluatePulseFireGate,
+  LASER_ACTIVE_DURATION_SEC,
   LASER_COOLDOWN_SEC,
   MATCH_DURATION_SEC,
   MOVE_SPEED,
@@ -106,11 +107,12 @@ export class TopDownArenaEngine {
   private obstacleImg: HTMLImageElement | null = null;
   private currentFloorUrl = '';
   private currentObstacleUrl = '';
+  private faceCutoutProvider: (() => HTMLCanvasElement | null) | null = null;
 
   // Local player circle state
   private selfId = 'local';
   private spawnIndex = 0;
-  private pos: Vec2 = { x: -18, z: -18 };
+  private pos: Vec2 = { x: -15, z: -8 };
   private vel: Vec2 = { x: 0, z: 0 };
   private spinAngle = 0;
   private spinDirection: 1 | -1 = 1;
@@ -121,6 +123,12 @@ export class TopDownArenaEngine {
   private gun: LaserGunConfig = createDefaultLaserGun();
   private cooldownRemainingSec = 0;
   private shootGestureName = DEFAULT_SHOOT_GESTURE.name;
+
+  // Sustained active laser sweep window (keeps laser active ~340ms to sweep wider attack area)
+  private activeLaserWindowRemaining = 0;
+  private currentPulseHitIds = new Set<string>();
+  private currentLiveBeams: LaserPulsePath[] = [];
+  private sweepRibbonTimer = 0;
 
   // Match clock & telemetry
   private timeRemainingSec = MATCH_DURATION_SEC;
@@ -316,15 +324,14 @@ export class TopDownArenaEngine {
     }
   }
 
+  public setFaceCutoutProvider(provider: (() => HTMLCanvasElement | null) | null) {
+    this.faceCutoutProvider = provider;
+  }
+
   public setArena(next: ArenaConfig) {
     this.arena = next;
     this.loadArenaTextures(next);
-    this.pos = resolveTopDownCollision(
-      this.pos,
-      PLAYER_RADIUS,
-      next.halfSize,
-      next.obstacles,
-    );
+    this.respawnSelfAtCorner(this.spawnIndex);
     this.rebuildBots();
   }
 
@@ -358,8 +365,8 @@ export class TopDownArenaEngine {
 
   private respawnSelfAtCorner(spawnIdx: number) {
     const sp = this.arena.spawnPoints[spawnIdx % this.arena.spawnPoints.length] ?? {
-      x: -18,
-      z: -18,
+      x: -14,
+      z: -8,
       yaw: 0,
     };
     this.pos = resolveTopDownCollision(
@@ -367,6 +374,7 @@ export class TopDownArenaEngine {
       PLAYER_RADIUS,
       this.arena.halfSize,
       this.arena.obstacles,
+      this.arena.borderPolygon,
     );
     this.vel = { x: 0, z: 0 };
     this.spinAngle = sp.yaw;
@@ -420,7 +428,14 @@ export class TopDownArenaEngine {
     let specIdx = 0;
     for (let spIdx = 0; spIdx < 4 && specIdx < specs.length; spIdx++) {
       if (occupiedSpawns.has(spIdx)) continue;
-      const sp = this.arena.spawnPoints[spIdx];
+      const sp = this.arena.spawnPoints[spIdx] ?? { x: 0, z: 0, color: '#f59e0b', yaw: 0 };
+      const safeBotPos = resolveTopDownCollision(
+        { x: sp.x, z: sp.z },
+        PLAYER_RADIUS,
+        this.arena.halfSize,
+        this.arena.obstacles,
+        this.arena.borderPolygon,
+      );
       const spec = specs[specIdx++];
       nextBots.push({
         id: `bot-${spIdx}`,
@@ -428,8 +443,8 @@ export class TopDownArenaEngine {
         archetype: spec.archetype,
         spawnIndex: spIdx,
         color: sp.color,
-        x: sp.x,
-        z: sp.z,
+        x: safeBotPos.x,
+        z: safeBotPos.z,
         vx: 0,
         vz: 0,
         spinAngle: sp.yaw,
@@ -535,6 +550,9 @@ export class TopDownArenaEngine {
     this.gestureCounts = {};
     this.voiceCommandsCount = 0;
     this.cooldownRemainingSec = 0;
+    this.activeLaserWindowRemaining = 0;
+    this.currentPulseHitIds.clear();
+    this.currentLiveBeams = [];
     this.callbacks.onCooldownChange(0, 0);
     this.activePulses = [];
     this.respawnSelfAtCorner(this.spawnIndex);
@@ -639,9 +657,27 @@ export class TopDownArenaEngine {
     }
 
     this.cooldownRemainingSec = gate.nextCooldownSec;
+    this.activeLaserWindowRemaining = LASER_ACTIVE_DURATION_SEC;
+    this.currentPulseHitIds.clear();
+    this.sweepRibbonTimer = 0;
+
     this.callbacks.onCooldownChange(this.cooldownRemainingSec, 1);
     this.callbacks.onPulseAccepted?.();
 
+    this.shotsFired += 1;
+    const isCurved = this.gun.shootingPoints.some((p) => Math.abs(p.curvature) > 0.08);
+    sfx.playLaserPulse(this.gun.shootingPoints.length, isCurved);
+    this.cameraTrauma = Math.min(1, this.cameraTrauma + 0.16);
+
+    this.evaluateActivePlayerBeams(true, true);
+    this.emitHudSnapshot(true);
+  }
+
+  /**
+   * Evaluates and sweeps the player's active laser beams across `LASER_ACTIVE_DURATION_SEC` (~340ms),
+   * expanding the effective attack area as the circle spins and moves while hitting each target at most once per pulse.
+   */
+  private evaluateActivePlayerBeams(emitAfterglowRibbon: boolean, isInitialFrame = false) {
     const targets: LaserTargetCircle[] = [];
     for (const b of this.bots) {
       targets.push({ id: b.id, x: b.x, z: b.z, radius: PLAYER_RADIUS });
@@ -652,8 +688,8 @@ export class TopDownArenaEngine {
       }
     }
 
-    const pulsesOut: LaserPulsePath[] = [];
-    const hitCountPerTarget = new Map<string, number>();
+    const liveBeams: LaserPulsePath[] = [];
+    const newlyHitTargets = new Map<string, number>();
 
     for (const pt of this.gun.shootingPoints) {
       const res = traceCurvedLaserBeam({
@@ -663,45 +699,54 @@ export class TopDownArenaEngine {
         point: pt,
         maxRange: this.gun.range,
         halfSize: this.arena.halfSize,
+        borderPolygon: this.arena.borderPolygon,
         obstacles: this.arena.obstacles,
         targets,
       });
 
-      pulsesOut.push({
+      const pathObj: LaserPulsePath = {
         points: res.points,
         color: this.gun.color,
         impactPoint: res.impactPoint,
-      });
+      };
+      liveBeams.push(pathObj);
 
-      this.activePulses.push({
-        points: res.points,
-        color: this.gun.color,
-        impactPoint: res.impactPoint,
-        age: 0,
-        duration: 0.3,
-      });
-
-      if (res.impactPoint) {
-        this.spawnImpactParticles(res.impactPoint.x, res.impactPoint.z, this.gun.color, 9);
+      if (emitAfterglowRibbon) {
+        this.activePulses.push({
+          points: res.points,
+          color: this.gun.color,
+          impactPoint: res.impactPoint,
+          age: 0,
+          duration: 0.22,
+        });
+        if (res.impactPoint) {
+          this.spawnImpactParticles(
+            res.impactPoint.x,
+            res.impactPoint.z,
+            this.gun.color,
+            isInitialFrame ? 8 : 3,
+          );
+        }
       }
 
       for (const tid of res.hitTargetIds) {
-        hitCountPerTarget.set(tid, (hitCountPerTarget.get(tid) || 0) + 1);
+        if (!this.currentPulseHitIds.has(tid)) {
+          newlyHitTargets.set(tid, (newlyHitTargets.get(tid) || 0) + 1);
+        }
       }
     }
 
-    this.shotsFired += 1;
-    const isCurved = this.gun.shootingPoints.some((p) => Math.abs(p.curvature) > 0.08);
-    sfx.playLaserPulse(this.gun.shootingPoints.length, isCurved);
-    this.cameraTrauma = Math.min(1, this.cameraTrauma + 0.16);
+    this.currentLiveBeams = liveBeams;
 
-    if (hitCountPerTarget.size > 0) {
-      this.shotsHit += 1;
-      this.hitmarkerTimer = 0.2;
+    if (newlyHitTargets.size > 0) {
+      if (this.currentPulseHitIds.size === 0) {
+        this.shotsHit += 1;
+      }
+      this.hitmarkerTimer = 0.22;
       let anyKilled = false;
 
-      for (const [tid, beamHits] of hitCountPerTarget.entries()) {
-        // Diminishing multi-beam overlap bonus so 6-beam point-blank bursts feel rewarding without insta-deleting
+      for (const [tid, beamHits] of newlyHitTargets.entries()) {
+        this.currentPulseHitIds.add(tid);
         const rawDmg =
           this.gun.damagePerBeam *
           (1 + (beamHits - 1) * 0.45) *
@@ -719,11 +764,18 @@ export class TopDownArenaEngine {
             bot.deaths += 1;
             bot.hp = bot.maxHp;
             const sp = this.arena.spawnPoints[bot.spawnIndex % this.arena.spawnPoints.length];
-            bot.x = sp.x;
-            bot.z = sp.z;
+            const safeSp = resolveTopDownCollision(
+              { x: sp.x, z: sp.z },
+              PLAYER_RADIUS,
+              this.arena.halfSize,
+              this.arena.obstacles,
+              this.arena.borderPolygon,
+            );
+            bot.x = safeSp.x;
+            bot.z = safeSp.z;
             bot.cooldownRemaining = 1.8;
             bot.telegraphRemaining = 0;
-            this.spawnImpactParticles(sp.x, sp.z, bot.color, 20);
+            this.spawnImpactParticles(safeSp.x, safeSp.z, bot.color, 20);
             this.callbacks.onBotKill(bot.name, this.gun.name);
           }
         } else if (this.remotePlayers.has(tid)) {
@@ -731,15 +783,17 @@ export class TopDownArenaEngine {
         }
       }
 
-      this.hitstopTimer = anyKilled ? 0.055 : 0.03;
+      this.hitstopTimer = anyKilled ? 0.05 : 0.025;
       if (anyKilled) {
         this.cameraTrauma = Math.min(1, this.cameraTrauma + 0.3);
       }
       sfx.playHitmarker(anyKilled);
+      this.emitHudSnapshot(true);
     }
 
-    this.callbacks.onBroadcastShot(pulsesOut);
-    this.emitHudSnapshot(true);
+    if (emitAfterglowRibbon) {
+      this.callbacks.onBroadcastShot(liveBeams);
+    }
   }
 
   private updateBots(simDt: number) {
@@ -820,6 +874,7 @@ export class TopDownArenaEngine {
           PLAYER_RADIUS,
           this.arena.halfSize,
           this.arena.obstacles,
+          this.arena.borderPolygon,
         );
         bot.x = nextPos.x;
         bot.z = nextPos.z;
@@ -872,6 +927,7 @@ export class TopDownArenaEngine {
         point: pt,
         maxRange: bot.gun.range,
         halfSize: this.arena.halfSize,
+        borderPolygon: this.arena.borderPolygon,
         obstacles: this.arena.obstacles,
         targets,
       });
@@ -881,7 +937,7 @@ export class TopDownArenaEngine {
         color: bot.color,
         impactPoint: res.impactPoint,
         age: 0,
-        duration: 0.28,
+        duration: 0.42,
       });
 
       if (res.impactPoint) {
@@ -1033,16 +1089,29 @@ export class TopDownArenaEngine {
         PLAYER_RADIUS,
         this.arena.halfSize,
         this.arena.obstacles,
+        this.arena.borderPolygon,
       );
     } else {
       // Stationary spin in place!
       this.vel = { x: 0, z: 0 };
     }
 
-    // 4. Consume queued single-pulse fire trigger
+    // 4. Consume queued single-pulse fire trigger OR sustain active sweeping laser window (~340ms)
     if (this.queuedPulseFire) {
       this.queuedPulseFire = false;
       this.firePlayerSinglePulse();
+    } else if (this.activeLaserWindowRemaining > 0) {
+      this.activeLaserWindowRemaining = Math.max(0, this.activeLaserWindowRemaining - simDt);
+      this.sweepRibbonTimer -= simDt;
+      if (this.activeLaserWindowRemaining > 0) {
+        const emitRibbon = this.sweepRibbonTimer <= 0;
+        if (emitRibbon) {
+          this.sweepRibbonTimer = 0.055;
+        }
+        this.evaluateActivePlayerBeams(emitRibbon, false);
+      } else {
+        this.currentLiveBeams = [];
+      }
     }
 
     // 5. Step AI Bots
@@ -1138,10 +1207,23 @@ export class TopDownArenaEngine {
     ctx.scale(pxPerMeter, pxPerMeter);
     ctx.translate(-this.camCenter.x, -this.camCenter.z);
 
-    // 1. Arena Floor (Nano Banana seamless tile texture or fallback)
+    const traceBorderPath = () => {
+      const poly = this.arena.borderPolygon;
+      ctx.beginPath();
+      if (poly && poly.length >= 3) {
+        ctx.moveTo(poly[0].x, poly[0].z);
+        for (let i = 1; i < poly.length; i++) {
+          ctx.lineTo(poly[i].x, poly[i].z);
+        }
+        ctx.closePath();
+      } else {
+        ctx.rect(-half, -half, half * 2, half * 2);
+      }
+    };
+
+    // 1. Arena Floor clipped to Custom AI Polygon Border (Nano Banana tile texture or fallback)
     ctx.save();
-    ctx.beginPath();
-    ctx.rect(-half, -half, half * 2, half * 2);
+    traceBorderPath();
     ctx.clip();
 
     if (this.floorImg && this.floorImg.complete && this.floorImg.naturalWidth > 0) {
@@ -1234,10 +1316,28 @@ export class TopDownArenaEngine {
 
     ctx.restore(); // End arena floor clip
 
-    // Arena Outer Perimeter Frame
+    // Custom Polygon Arena Outer Perimeter Glow + Crisp Frame + Corner Bolts
+    ctx.save();
+    traceBorderPath();
     ctx.strokeStyle = this.arena.palette.accentGlow || '#38bdf8';
-    ctx.lineWidth = 0.22;
-    ctx.strokeRect(-half, -half, half * 2, half * 2);
+    ctx.globalAlpha = 0.22;
+    ctx.lineWidth = 0.68;
+    ctx.lineJoin = 'round';
+    ctx.stroke();
+
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = 0.24;
+    ctx.stroke();
+
+    if (this.arena.borderPolygon && this.arena.borderPolygon.length >= 3) {
+      ctx.fillStyle = '#e2e8f0';
+      for (const v of this.arena.borderPolygon) {
+        ctx.beginPath();
+        ctx.arc(v.x, v.z, 0.2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
 
     // 4. Title Showcase OR Active Gameplay Entities
     if (this.phase === 'title') {
@@ -1317,7 +1417,40 @@ export class TopDownArenaEngine {
       });
     }
 
-    // 5. Active Curved & Straight Laser Pulses
+    // 5a. Sustained Live Active Sweeping Laser Beams (~340ms window)
+    if (this.activeLaserWindowRemaining > 0 && this.currentLiveBeams.length > 0) {
+      for (const beam of this.currentLiveBeams) {
+        if (beam.points.length < 2) continue;
+        ctx.save();
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+
+        ctx.beginPath();
+        ctx.moveTo(beam.points[0].x, beam.points[0].z);
+        for (let i = 1; i < beam.points.length; i++) {
+          ctx.lineTo(beam.points[i].x, beam.points[i].z);
+        }
+        ctx.strokeStyle = beam.color;
+        ctx.globalAlpha = 0.68;
+        ctx.lineWidth = 0.72;
+        ctx.stroke();
+
+        ctx.strokeStyle = '#ffffff';
+        ctx.globalAlpha = 0.98;
+        ctx.lineWidth = 0.24;
+        ctx.stroke();
+
+        if (beam.impactPoint) {
+          ctx.beginPath();
+          ctx.arc(beam.impactPoint.x, beam.impactPoint.z, 0.5, 0, Math.PI * 2);
+          ctx.fillStyle = '#ffffff';
+          ctx.fill();
+        }
+        ctx.restore();
+      }
+    }
+
+    // 5b. Fading Swept Laser Afterglow Trails & Bot Pulses
     for (const pulse of this.activePulses) {
       if (pulse.points.length < 2) continue;
       const t = 1 - pulse.age / pulse.duration;
@@ -1332,19 +1465,19 @@ export class TopDownArenaEngine {
         ctx.lineTo(pulse.points[i].x, pulse.points[i].z);
       }
       ctx.strokeStyle = pulse.color;
-      ctx.globalAlpha = Math.max(0, t * 0.48);
-      ctx.lineWidth = 0.58 * t + 0.14;
+      ctx.globalAlpha = Math.max(0, t * 0.36);
+      ctx.lineWidth = 0.54 * t + 0.12;
       ctx.stroke();
 
       // Inner white-hot core
       ctx.strokeStyle = '#ffffff';
-      ctx.globalAlpha = Math.max(0, t * 0.95);
-      ctx.lineWidth = 0.18 * t + 0.04;
+      ctx.globalAlpha = Math.max(0, t * 0.78);
+      ctx.lineWidth = 0.15 * t + 0.03;
       ctx.stroke();
 
       if (pulse.impactPoint) {
         ctx.beginPath();
-        ctx.arc(pulse.impactPoint.x, pulse.impactPoint.z, 0.42 * t + 0.08, 0, Math.PI * 2);
+        ctx.arc(pulse.impactPoint.x, pulse.impactPoint.z, 0.36 * t + 0.06, 0, Math.PI * 2);
         ctx.fillStyle = '#ffffff';
         ctx.fill();
       }
@@ -1388,6 +1521,7 @@ export class TopDownArenaEngine {
         point: pt,
         maxRange: gun.range,
         halfSize: this.arena.halfSize,
+        borderPolygon: this.arena.borderPolygon,
         obstacles: this.arena.obstacles,
         targets: [],
       });
@@ -1461,48 +1595,72 @@ export class TopDownArenaEngine {
       ctx.restore();
     }
 
-    // Main circular player body ("the player is just a circle")
+    // Main circular player body ("the player is just a circle", with live webcam face cutout inside!)
+    const faceCanvas = opts.isSelf ? this.faceCutoutProvider?.() ?? null : null;
+
     ctx.beginPath();
     ctx.arc(0, 0, r, 0, Math.PI * 2);
     ctx.fillStyle = opts.hitFlash ? '#ffffff' : opts.isSelf ? '#0b192c' : '#0f172a';
     ctx.fill();
+
+    if (faceCanvas) {
+      // Clip player's live cropped webcam face cleanly inside the circle!
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(0, 0, r * 0.91, 0, Math.PI * 2);
+      ctx.clip();
+      ctx.drawImage(faceCanvas, -r * 0.91, -r * 0.91, r * 1.82, r * 1.82);
+      if (opts.cooldownRatio > 0) {
+        ctx.fillStyle = 'rgba(3, 6, 15, 0.34)';
+        ctx.fillRect(-r, -r, r * 2, r * 2);
+      }
+      if (opts.hitFlash) {
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.55)';
+        ctx.fillRect(-r, -r, r * 2, r * 2);
+      }
+      ctx.restore();
+    } else {
+      // Inner core silhouette differentiation when webcam face cutout is off
+      ctx.beginPath();
+      if (opts.isSelf) {
+        ctx.arc(0, 0, r * 0.38, 0, Math.PI * 2);
+      } else if (opts.archetype === 'sniper_kiter') {
+        ctx.moveTo(0, -r * 0.42);
+        ctx.lineTo(r * 0.38, r * 0.32);
+        ctx.lineTo(-r * 0.38, r * 0.32);
+        ctx.closePath();
+      } else if (opts.archetype === 'nova_charger') {
+        ctx.rect(-r * 0.32, -r * 0.32, r * 0.64, r * 0.64);
+      } else {
+        ctx.arc(0, 0, r * 0.34, 0, Math.PI * 2);
+      }
+      ctx.fillStyle = opts.cooldownRatio > 0
+        ? 'rgba(100, 116, 139, 0.48)'
+        : opts.isSelf
+          ? '#ffffff'
+          : opts.color;
+      ctx.fill();
+    }
+
+    // Crisp outer circle stroke
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
     ctx.lineWidth = opts.isSelf ? 0.18 : 0.13;
     ctx.strokeStyle = opts.hitFlash ? '#ffffff' : opts.isSelf ? opts.gun.color : opts.color;
     ctx.stroke();
 
-    // Inner core silhouette differentiation for player vs bots
-    ctx.beginPath();
-    if (opts.isSelf) {
-      ctx.arc(0, 0, r * 0.38, 0, Math.PI * 2);
-    } else if (opts.archetype === 'sniper_kiter') {
-      ctx.moveTo(0, -r * 0.42);
-      ctx.lineTo(r * 0.38, r * 0.32);
-      ctx.lineTo(-r * 0.38, r * 0.32);
-      ctx.closePath();
-    } else if (opts.archetype === 'nova_charger') {
-      ctx.rect(-r * 0.32, -r * 0.32, r * 0.64, r * 0.64);
-    } else {
-      ctx.arc(0, 0, r * 0.34, 0, Math.PI * 2);
-    }
-    ctx.fillStyle = opts.cooldownRatio > 0
-      ? 'rgba(100, 116, 139, 0.48)'
-      : opts.isSelf
-        ? '#ffffff'
-        : opts.color;
-    ctx.fill();
-
-    // 3.0s Cooldown Recharging Arc right on the circle chassis
+    // 3.0s Cooldown Recharging Arc right on the circle perimeter
     if (opts.cooldownRatio > 0.01) {
       ctx.beginPath();
       ctx.arc(
         0,
         0,
-        r * 0.64,
+        faceCanvas ? r * 0.84 : r * 0.64,
         -Math.PI * 0.5,
         -Math.PI * 0.5 + Math.PI * 2 * (1 - opts.cooldownRatio),
       );
       ctx.strokeStyle = '#f43f5e';
-      ctx.lineWidth = 0.11;
+      ctx.lineWidth = 0.12;
       ctx.stroke();
     }
 

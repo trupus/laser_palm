@@ -13,12 +13,13 @@ import {
 } from '@google/genai';
 import {
   applyDamageAndRespawn,
+  computeSafePolygonSpawns,
   createDefaultArenaConfig,
   createDefaultLaserGun,
-  createDefaultSpawnPoints,
   MATCH_DURATION_SEC,
   MAX_PLAYERS_PER_ROOM,
   sanitizeArenaObstacles,
+  sanitizeBorderPolygon,
   sanitizeLaserGunConfig,
 } from './src/game/rules.ts';
 import { DEFAULT_SHOOT_GESTURE } from './src/game/gestures.ts';
@@ -30,6 +31,7 @@ import type {
   MatchTelemetry,
   ObstacleSpec,
   RoomPlayerState,
+  Vec2,
 } from './src/game/types.ts';
 
 const isProduction = process.env.NODE_ENV === 'production';
@@ -393,22 +395,52 @@ Examples:
     }
   });
 
-  // 3. AI Top-Down Level Layout (gemini-4-hydrogen) + Nano Banana Arena Textures (gemini-3.1-flash-lite-image)
+  // 3. AI Top-Down Level & Non-Square Polygon Border Generator (gemini-4-hydrogen) + Nano Banana Arena Textures (gemini-3.1-flash-lite-image)
   app.post('/api/gemini/arena', async (req, res) => {
     try {
-      const theme = String(req.body?.theme || 'Obsidian Laser Crucible').slice(0, 140);
+      const randomShapeArchetypes = [
+        'Five-Pointed Star Bastion with central prism monolith',
+        'Asymmetric Volcanic Crater with obsidian pillars',
+        'Narrow-Waist Hourglass Rift with twin choke barriers',
+        'Crescent Moon Canyon with curved flank cover',
+        'Hexagonal Reactor Core with radial shield walls',
+        'Jagged Crystal Diamond with sniper lanes',
+        'Irregular Asteroid Cavern with scattered megaliths',
+        'Trefoil Bio-Foundry with three asymmetrical lobes',
+      ];
+      const randomShape = Boolean(req.body?.randomShape);
+      const pickedArchetype =
+        randomShapeArchetypes[Math.floor(Math.random() * randomShapeArchetypes.length)];
+      const rawTheme = String(req.body?.theme || '').trim();
+      const theme = (
+        randomShape
+          ? rawTheme
+            ? `${rawTheme} — Random Border Silhouette: ${pickedArchetype}`
+            : pickedArchetype
+          : rawTheme || 'Star-Shaped Obsidian Laser Crucible'
+      ).slice(0, 180);
+
       const shouldGenTextures = req.body?.generateTextures !== false;
       const ai = getAiClient();
       const halfSize = 22;
-      const spawnPoints = createDefaultSpawnPoints(halfSize);
 
       const layoutPromise = ai.models.generateContent({
         model: 'gemini-4-hydrogen',
-        contents: `Design a balanced top-down 2D multiplayer laser arena layout for up to 4 spinning circle players in a 44m x 44m yard (coordinates -20 to +20 on X and Z).
-Theme: "${theme}".
-Leave the 4 corners (-18,-18), (18,18), (18,-18), (-18,18) clear for player spawns.
-Include 8 to 13 tactical top-down obstacles (pillars, angled/corridor barriers, crates, and a centerpiece monolith) that create fun sightlines for both long straight lasers and medium curved hook lasers.
-Use cohesive dark surface colors with one crisp accent glow hex color (#RRGGBB).`,
+        contents: `Design a complete top-down 2D multiplayer laser arena level—including a custom NON-SQUARE outer map border polygon and tactical interior obstacles—for up to 4 spinning circle players inside a 44m x 44m coordinate space (X and Z from -21 to +21).
+
+Level Request / Theme: "${theme}"
+
+CRITICAL GEOMETRY RULES:
+1. Custom Map Border Polygon (borderPolygon):
+   - Output between 6 and 18 ordered 2D vertices { x, z } in counter-clockwise order around the origin (0, 0), within [-21, +21].
+   - NEVER output an axis-aligned 4-corner square! If the prompt describes a specific shape (e.g., triangle, star, hexagon, crescent, diamond, hourglass, cross, L-shape, heart, irregular crater), match that exact shape cleanly. Otherwise invent a bold, playable non-square polygon silhouette that fits the theme.
+   - Ensure the polygon has a generous playable interior (spanning roughly 32m to 42m across, area >= 700 m^2) with no self-intersecting edges.
+2. Suggested Spawns (suggestedSpawns):
+   - Provide 4 well-separated { x, z } spawn coordinates strictly inside borderPolygon (at least 3m inward from any border edge).
+3. Obstacles (obstacles):
+   - Provide 7 to 13 top-down obstacles (pillars, corridor barriers, crates, and a centerpiece monolith) placed strictly inside borderPolygon and clear of the 4 spawns, creating fun sightlines for both long straight lasers and curved hook lasers.
+4. Palette:
+   - Use cohesive dark playable floor/wall hex colors (#RRGGBB) with one crisp accentGlow hex color (#RRGGBB).`,
         config: {
           thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
           responseMimeType: 'application/json',
@@ -417,6 +449,29 @@ Use cohesive dark surface colors with one crisp accent glow hex color (#RRGGBB).
             properties: {
               name: { type: Type.STRING },
               tagline: { type: Type.STRING },
+              borderShapeName: { type: Type.STRING },
+              borderPolygon: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    x: { type: Type.NUMBER },
+                    z: { type: Type.NUMBER },
+                  },
+                  required: ['x', 'z'],
+                },
+              },
+              suggestedSpawns: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    x: { type: Type.NUMBER },
+                    z: { type: Type.NUMBER },
+                  },
+                  required: ['x', 'z'],
+                },
+              },
               palette: {
                 type: Type.OBJECT,
                 properties: {
@@ -470,7 +525,16 @@ Use cohesive dark surface colors with one crisp accent glow hex color (#RRGGBB).
                 },
               },
             },
-            required: ['name', 'tagline', 'palette', 'mutator', 'obstacles'],
+            required: [
+              'name',
+              'tagline',
+              'borderShapeName',
+              'borderPolygon',
+              'suggestedSpawns',
+              'palette',
+              'mutator',
+              'obstacles',
+            ],
           },
         },
       });
@@ -501,6 +565,21 @@ Use cohesive dark surface colors with one crisp accent glow hex color (#RRGGBB).
 
       const raw = JSON.parse(layoutRes.value.text || '{}');
       const fallback = createDefaultArenaConfig();
+
+      const rawPoly: Vec2[] | undefined = Array.isArray(raw.borderPolygon)
+        ? raw.borderPolygon.map((pt: Record<string, unknown>) => ({
+            x: Number(pt.x),
+            z: Number(pt.z),
+          }))
+        : undefined;
+
+      const borderPolygon = sanitizeBorderPolygon(rawPoly, halfSize, Math.random() * 100);
+      const spawnPoints = computeSafePolygonSpawns(
+        borderPolygon,
+        halfSize,
+        Array.isArray(raw.suggestedSpawns) ? raw.suggestedSpawns : undefined,
+      );
+
       const rawObs: ObstacleSpec[] = Array.isArray(raw.obstacles)
         ? raw.obstacles.map((o: Record<string, unknown>, idx: number) => ({
             id: String(o.id || `ai-obs-${idx}`),
@@ -516,7 +595,14 @@ Use cohesive dark surface colors with one crisp accent glow hex color (#RRGGBB).
           }))
         : fallback.obstacles;
 
-      const sanitized = sanitizeArenaObstacles(rawObs, spawnPoints, halfSize);
+      const sanitized = sanitizeArenaObstacles(rawObs, spawnPoints, halfSize, borderPolygon);
+      const fallbackInsidePoly = sanitizeArenaObstacles(
+        fallback.obstacles,
+        spawnPoints,
+        halfSize,
+        borderPolygon,
+      );
+
       const hexOr = (val: unknown, fb: string) =>
         typeof val === 'string' && /^#[0-9a-fA-F]{6}$/.test(val) ? val : fb;
 
@@ -535,14 +621,16 @@ Use cohesive dark surface colors with one crisp accent glow hex color (#RRGGBB).
               : null;
         textureWarning =
           reason instanceof Error
-            ? `Layout generated; Nano Banana texture note: ${reason.message}`
-            : 'Layout generated; using fallback texture for missing slot.';
+            ? `AI polygon level generated; Nano Banana texture note: ${reason.message}`
+            : 'AI polygon level generated; using default texture for missing slot.';
       }
 
       const arena: ArenaConfig = {
         name: String(raw.name || fallback.name).slice(0, 48),
         tagline: String(raw.tagline || fallback.tagline).slice(0, 110),
         halfSize,
+        borderShapeName: String(raw.borderShapeName || 'Custom Polygon Border').slice(0, 40),
+        borderPolygon,
         spawnPoints,
         palette: {
           skyColor: hexOr(raw.palette?.skyColor, fallback.palette.skyColor),
@@ -571,7 +659,7 @@ Use cohesive dark surface colors with one crisp accent glow hex color (#RRGGBB).
             Math.min(1.5, Number(raw.mutator?.damageMultiplier) || 1),
           ),
         },
-        obstacles: sanitized.length >= 4 ? sanitized : fallback.obstacles,
+        obstacles: sanitized.length >= 2 ? sanitized : fallbackInsidePoly,
         floorTextureUrl,
         obstacleTextureUrl,
       };
@@ -1028,7 +1116,7 @@ Standings: ${JSON.stringify(telemetry.players)}.`,
               ],
             },
           ],
-          systemInstruction: `You are PALMSTRIKE's tactical voice co-pilot in a top-down spinning laser arena.
+          systemInstruction: `You are LASER PALM's tactical voice co-pilot in a top-down spinning laser arena.
 Recognize voice commands immediately:
 - If the player says "pulse", "fire", or "shoot", call trigger_laser_action({ action: "pulse" }).
 - If the player says "reverse" or "flip", call trigger_laser_action({ action: "reverse_spin" }).
@@ -1181,7 +1269,7 @@ Respond with a crisp 1-2 word confirmation.`,
   }
 
   server.listen(PORT, '0.0.0.0', () => {
-    console.log(`PalmStrike Top-Down Laser Arena server listening on http://0.0.0.0:${PORT}`);
+    console.log(`Laser Palm Top-Down Arena server listening on http://0.0.0.0:${PORT}`);
   });
 }
 

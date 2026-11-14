@@ -391,6 +391,7 @@ export default function App() {
         }
       },
     });
+    engine.setFaceCutoutProvider(() => tracker.getFaceCutoutCanvas());
     engineRef.current = engine;
 
     const mp = new MultiplayerClient({
@@ -662,15 +663,31 @@ export default function App() {
     });
   };
 
-  const handleGenerateArena = async (theme: string): Promise<string | undefined> => {
+  const handleGenerateArena = async (
+    theme: string,
+    options?: { generateTextures?: boolean; randomShape?: boolean },
+  ): Promise<string | undefined> => {
+    const generateTextures = options?.generateTextures ?? true;
     const res = await fetch('/api/gemini/arena', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ theme, generateTextures: true }),
+      body: JSON.stringify({
+        theme,
+        generateTextures,
+        randomShape: Boolean(options?.randomShape),
+      }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Failed to generate arena');
-    const nextArena = data.arena as ArenaConfig;
+    const rawArena = data.arena as ArenaConfig;
+    const nextArena: ArenaConfig = {
+      ...rawArena,
+      floorTextureUrl:
+        rawArena.floorTextureUrl ?? (!generateTextures ? arenaRef.current.floorTextureUrl : undefined),
+      obstacleTextureUrl:
+        rawArena.obstacleTextureUrl ??
+        (!generateTextures ? arenaRef.current.obstacleTextureUrl : undefined),
+    };
     setArena(nextArena);
     arenaRef.current = nextArena;
     engineRef.current?.setArena(nextArena);

@@ -1,4 +1,4 @@
-import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+import { FaceDetector, FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
 import {
   captureGestureTemplateFromLandmarks,
   classifyHandGestures,
@@ -25,9 +25,14 @@ const HAND_CONNECTIONS: Array<[number, number]> = [
 
 export class OnDeviceHandTracker {
   private landmarker: HandLandmarker | null = null;
+  private faceDetector: FaceDetector | null = null;
   private stream: MediaStream | null = null;
   private videoEl: HTMLVideoElement | null = null;
   private canvasEl: HTMLCanvasElement | null = null;
+  private faceCutoutCanvas: HTMLCanvasElement | null = null;
+  private hasFaceFrame = false;
+  private frameCounter = 0;
+  private smoothFaceBox = { cx: 0.5, cy: 0.38, size: 0.36, locked: false };
   private rafId = 0;
   private lastVideoTime = -1;
   private tracker = createGestureEdgeTracker();
@@ -90,6 +95,10 @@ export class OnDeviceHandTracker {
     return this.active;
   }
 
+  public getFaceCutoutCanvas(): HTMLCanvasElement | null {
+    return this.active && this.hasFaceFrame ? this.faceCutoutCanvas : null;
+  }
+
   public async start(
     videoEl: HTMLVideoElement,
     overlayCanvas: HTMLCanvasElement | null,
@@ -99,8 +108,18 @@ export class OnDeviceHandTracker {
     this.canvasEl = overlayCanvas;
     this.onSnapshot = onSnapshot;
 
-    if (!this.landmarker) {
-      const vision = await FilesetResolver.forVisionTasks('/mediapipe/wasm');
+    if (!this.faceCutoutCanvas && typeof document !== 'undefined') {
+      this.faceCutoutCanvas = document.createElement('canvas');
+      this.faceCutoutCanvas.width = 128;
+      this.faceCutoutCanvas.height = 128;
+    }
+
+    const vision =
+      !this.landmarker || !this.faceDetector
+        ? await FilesetResolver.forVisionTasks('/mediapipe/wasm')
+        : null;
+
+    if (!this.landmarker && vision) {
       this.landmarker = await HandLandmarker.createFromOptions(vision, {
         baseOptions: {
           modelAssetPath: '/mediapipe/hand_landmarker.task',
@@ -114,6 +133,33 @@ export class OnDeviceHandTracker {
       });
     }
 
+    if (!this.faceDetector && vision) {
+      try {
+        this.faceDetector = await FaceDetector.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: '/mediapipe/blaze_face_short_range.tflite',
+            delegate: 'GPU',
+          },
+          runningMode: 'VIDEO',
+          minDetectionConfidence: 0.45,
+        });
+      } catch {
+        try {
+          this.faceDetector = await FaceDetector.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath: '/mediapipe/blaze_face_short_range.tflite',
+              delegate: 'CPU',
+            },
+            runningMode: 'VIDEO',
+            minDetectionConfidence: 0.45,
+          });
+        } catch {
+          // Graceful fallback to centered portrait crop if BlazeFace unavailable
+          this.faceDetector = null;
+        }
+      }
+    }
+
     this.stream = await navigator.mediaDevices.getUserMedia({
       video: { width: 640, height: 480, facingMode: 'user' },
       audio: false,
@@ -122,6 +168,9 @@ export class OnDeviceHandTracker {
     videoEl.srcObject = this.stream;
     await videoEl.play();
     this.active = true;
+    this.hasFaceFrame = false;
+    this.frameCounter = 0;
+    this.smoothFaceBox = { cx: 0.5, cy: 0.38, size: 0.36, locked: false };
     this.lastVideoTime = -1;
     this.loop();
   }
@@ -146,6 +195,7 @@ export class OnDeviceHandTracker {
 
   public stop() {
     this.active = false;
+    this.hasFaceFrame = false;
     this.lastRightLandmarks = null;
     if (this.rafId) {
       cancelAnimationFrame(this.rafId);
@@ -162,13 +212,73 @@ export class OnDeviceHandTracker {
     }
   }
 
+  private updateFaceCutout(video: HTMLVideoElement, nowMs: number) {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    if (!vw || !vh || !this.faceCutoutCanvas) return;
+
+    if (this.faceDetector && this.frameCounter % 2 === 0) {
+      try {
+        const faceRes = this.faceDetector.detectForVideo(video, nowMs);
+        const detections = faceRes.detections ?? [];
+        let bestBb: { originX: number; originY: number; width: number; height: number } | null = null;
+        let bestArea = 0;
+        for (const det of detections) {
+          const bb = det.boundingBox;
+          if (!bb) continue;
+          const area = bb.width * bb.height;
+          if (area > bestArea) {
+            bestArea = area;
+            bestBb = bb;
+          }
+        }
+        if (bestBb && bestBb.width > 12 && bestBb.height > 12) {
+          const rawCx = (bestBb.originX + bestBb.width * 0.5) / vw;
+          const rawCy = (bestBb.originY + bestBb.height * 0.44) / vh;
+          const rawSize = Math.max(
+            0.2,
+            Math.min(0.85, (Math.max(bestBb.width, bestBb.height) * 1.32) / Math.min(vw, vh)),
+          );
+          const alpha = this.smoothFaceBox.locked ? 0.26 : 1.0;
+          this.smoothFaceBox = {
+            cx: this.smoothFaceBox.cx + (rawCx - this.smoothFaceBox.cx) * alpha,
+            cy: this.smoothFaceBox.cy + (rawCy - this.smoothFaceBox.cy) * alpha,
+            size: this.smoothFaceBox.size + (rawSize - this.smoothFaceBox.size) * alpha,
+            locked: true,
+          };
+        }
+      } catch {
+        // Ignore transient detector timestamp collision
+      }
+    }
+
+    const side = Math.max(48, Math.min(vw, vh) * this.smoothFaceBox.size);
+    const sx = Math.max(0, Math.min(vw - side, this.smoothFaceBox.cx * vw - side * 0.5));
+    const sy = Math.max(0, Math.min(vh - side, this.smoothFaceBox.cy * vh - side * 0.5));
+
+    const fctx = this.faceCutoutCanvas.getContext('2d');
+    if (!fctx) return;
+    const outSize = this.faceCutoutCanvas.width;
+    fctx.clearRect(0, 0, outSize, outSize);
+    fctx.save();
+    // Mirror horizontally so moving/tilting head matches mirror view
+    fctx.scale(-1, 1);
+    fctx.drawImage(video, sx, sy, side, side, -outSize, 0, outSize, outSize);
+    fctx.restore();
+    this.hasFaceFrame = true;
+  }
+
   private loop = () => {
     if (!this.active || !this.videoEl || !this.landmarker) return;
 
     const video = this.videoEl;
     if (video.readyState >= 2 && video.currentTime !== this.lastVideoTime) {
       this.lastVideoTime = video.currentTime;
-      const result = this.landmarker.detectForVideo(video, performance.now());
+      this.frameCounter += 1;
+      const nowMs = performance.now();
+
+      const result = this.landmarker.detectForVideo(video, nowMs);
+      this.updateFaceCutout(video, nowMs + 0.05);
 
       const rawHands: Array<{ landmarks: HandLandmark[]; categoryName?: string }> = [];
       const handednessList = result.handedness ?? result.handednesses ?? [];
@@ -248,6 +358,21 @@ export class OnDeviceHandTracker {
     // Base subtle dark tint for skeleton legibility
     ctx.fillStyle = 'rgba(9, 11, 16, 0.24)';
     ctx.fillRect(0, 0, w, h);
+
+    // Subtle circular Face Cutout guide in mirrored coordinates
+    const faceMirroredX = (1 - this.smoothFaceBox.cx) * w;
+    const faceY = this.smoothFaceBox.cy * h;
+    const faceRadius = Math.max(18, Math.min(w, h) * this.smoothFaceBox.size * 0.42);
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(faceMirroredX, faceY, faceRadius, 0, Math.PI * 2);
+    ctx.strokeStyle = this.smoothFaceBox.locked
+      ? 'rgba(56, 189, 248, 0.72)'
+      : 'rgba(148, 163, 184, 0.45)';
+    ctx.lineWidth = 1.4;
+    ctx.setLineDash([4, 3]);
+    ctx.stroke();
+    ctx.restore();
 
     const drawSkeleton = (
       lm: HandLandmark[],

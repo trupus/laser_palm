@@ -14,6 +14,7 @@ export const PLAYER_RADIUS = 0.82;
 export const MOVE_SPEED = 8.4;
 export const DEFAULT_SPIN_SPEED = 0.95; // rad/s — deliberate, smooth continuous spin
 export const LASER_COOLDOWN_SEC = 3.0; // Mandatory 3-second cooldown between single laser pulses
+export const LASER_ACTIVE_DURATION_SEC = 0.34; // Keep laser active ~340ms so spinning/moving sweeps a wider attack area
 export const MAX_SHOOTING_POINTS = 12;
 export const BASE_SINGLE_LASER_RANGE = 26.0;
 export const MIN_LASER_RANGE = 5.2;
@@ -157,14 +158,362 @@ export function cyclePresetGun(currentId: string): LaserGunConfig {
   return PRESET_LASER_GUNS[(idx + 1) % PRESET_LASER_GUNS.length];
 }
 
+export type ProceduralBorderStyle =
+  | 'octagon'
+  | 'hexagon'
+  | 'star'
+  | 'hourglass'
+  | 'crater'
+  | 'diamond';
+
+export function createProceduralArenaPolygon(
+  style: ProceduralBorderStyle = 'octagon',
+  halfSize = 22,
+  seed = 1,
+): Vec2[] {
+  const pts: Vec2[] = [];
+  if (style === 'octagon') {
+    const n = 8;
+    const r = halfSize * 0.98;
+    for (let i = 0; i < n; i++) {
+      const a = (i * Math.PI * 2) / n + Math.PI / 8;
+      pts.push({
+        x: Number((Math.cos(a) * r).toFixed(2)),
+        z: Number((Math.sin(a) * r).toFixed(2)),
+      });
+    }
+    return pts;
+  }
+  if (style === 'hexagon') {
+    const n = 6;
+    const r = halfSize * 0.98;
+    for (let i = 0; i < n; i++) {
+      const a = (i * Math.PI * 2) / n;
+      pts.push({
+        x: Number((Math.cos(a) * r).toFixed(2)),
+        z: Number((Math.sin(a) * r).toFixed(2)),
+      });
+    }
+    return pts;
+  }
+  if (style === 'diamond') {
+    return [
+      { x: 0, z: -halfSize * 0.98 },
+      { x: halfSize * 0.96, z: 0 },
+      { x: 0, z: halfSize * 0.98 },
+      { x: -halfSize * 0.96, z: 0 },
+    ];
+  }
+  if (style === 'star') {
+    const spikes = 5;
+    const outerR = halfSize * 0.98;
+    const innerR = halfSize * 0.62;
+    for (let i = 0; i < spikes * 2; i++) {
+      const r = i % 2 === 0 ? outerR : innerR;
+      const a = (i * Math.PI) / spikes - Math.PI * 0.5;
+      pts.push({
+        x: Number((Math.cos(a) * r).toFixed(2)),
+        z: Number((Math.sin(a) * r).toFixed(2)),
+      });
+    }
+    return pts;
+  }
+  if (style === 'hourglass') {
+    const w = halfSize * 0.92;
+    const h = halfSize * 0.94;
+    const waist = halfSize * 0.46;
+    return [
+      { x: -w, z: -h },
+      { x: w, z: -h },
+      { x: w, z: -h * 0.45 },
+      { x: waist, z: 0 },
+      { x: w, z: h * 0.45 },
+      { x: w, z: h },
+      { x: -w, z: h },
+      { x: -w, z: h * 0.45 },
+      { x: -waist, z: 0 },
+      { x: -w, z: -h * 0.45 },
+    ];
+  }
+
+  // Organic irregular crater ('crater')
+  const count = 14;
+  for (let i = 0; i < count; i++) {
+    const a = (i * Math.PI * 2) / count;
+    const wave =
+      0.83 +
+      0.11 * Math.sin(a * 3 + seed * 1.7) +
+      0.07 * Math.cos(a * 5 - seed * 2.3);
+    const r = halfSize * wave;
+    pts.push({
+      x: Number((Math.cos(a) * r).toFixed(2)),
+      z: Number((Math.sin(a) * r).toFixed(2)),
+    });
+  }
+  return pts;
+}
+
+export function computePolygonSignedArea(poly: Vec2[]): number {
+  if (poly.length < 3) return 0;
+  let sum = 0;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    sum += a.x * b.z - b.x * a.z;
+  }
+  return sum * 0.5;
+}
+
+export function pointInPolygon(pt: Vec2, poly: Vec2[]): boolean {
+  if (poly.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const xi = poly[i].x;
+    const zi = poly[i].z;
+    const xj = poly[j].x;
+    const zj = poly[j].z;
+    const intersect =
+      zi > pt.z !== zj > pt.z &&
+      pt.x < ((xj - xi) * (pt.z - zi)) / (zj - zi + 1e-12) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+function closestPointOnSegment(
+  px: number,
+  pz: number,
+  ax: number,
+  az: number,
+  bx: number,
+  bz: number,
+): { x: number; z: number; distSq: number } {
+  const dx = bx - ax;
+  const dz = bz - az;
+  const lenSq = dx * dx + dz * dz;
+  const t =
+    lenSq > 1e-9 ? Math.max(0, Math.min(1, ((px - ax) * dx + (pz - az) * dz) / lenSq)) : 0;
+  const cx = ax + dx * t;
+  const cz = az + dz * t;
+  const ex = px - cx;
+  const ez = pz - cz;
+  return { x: cx, z: cz, distSq: ex * ex + ez * ez };
+}
+
+export function distanceToPolygonBorder(
+  pt: Vec2,
+  poly: Vec2[],
+): { dist: number; closest: Vec2; edgeNormalInward: Vec2 } {
+  let bestDistSq = Infinity;
+  let bestClosest: Vec2 = { x: 0, z: 0 };
+  let bestEdgeA: Vec2 = poly[0] ?? { x: 0, z: 0 };
+  let bestEdgeB: Vec2 = poly[1] ?? { x: 1, z: 0 };
+
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    const res = closestPointOnSegment(pt.x, pt.z, a.x, a.z, b.x, b.z);
+    if (res.distSq < bestDistSq) {
+      bestDistSq = res.distSq;
+      bestClosest = { x: res.x, z: res.z };
+      bestEdgeA = a;
+      bestEdgeB = b;
+    }
+  }
+
+  const edx = bestEdgeB.x - bestEdgeA.x;
+  const edz = bestEdgeB.z - bestEdgeA.z;
+  const elen = Math.max(1e-6, Math.hypot(edx, edz));
+  const n1 = { x: -edz / elen, z: edx / elen };
+  const n2 = { x: edz / elen, z: -edx / elen };
+  const midX = (bestEdgeA.x + bestEdgeB.x) * 0.5;
+  const midZ = (bestEdgeA.z + bestEdgeB.z) * 0.5;
+  const test1 = { x: midX + n1.x * 0.35, z: midZ + n1.z * 0.35 };
+  const inward = pointInPolygon(test1, poly) ? n1 : n2;
+
+  return {
+    dist: Math.sqrt(bestDistSq),
+    closest: bestClosest,
+    edgeNormalInward: inward,
+  };
+}
+
+function segmentsProperlyIntersect(a1: Vec2, a2: Vec2, b1: Vec2, b2: Vec2): boolean {
+  const d1x = a2.x - a1.x;
+  const d1z = a2.z - a1.z;
+  const d2x = b2.x - b1.x;
+  const d2z = b2.z - b1.z;
+  const denom = d1x * d2z - d1z * d2x;
+  if (Math.abs(denom) < 1e-8) return false;
+  const t = ((b1.x - a1.x) * d2z - (b1.z - a1.z) * d2x) / denom;
+  const u = ((b1.x - a1.x) * d1z - (b1.z - a1.z) * d1x) / denom;
+  return t > 0.001 && t < 0.999 && u > 0.001 && u < 0.999;
+}
+
+function hasSelfIntersection(poly: Vec2[]): boolean {
+  const n = poly.length;
+  if (n < 4) return false;
+  for (let i = 0; i < n; i++) {
+    const a1 = poly[i];
+    const a2 = poly[(i + 1) % n];
+    for (let j = i + 2; j < n; j++) {
+      if (i === 0 && j === n - 1) continue;
+      const b1 = poly[j];
+      const b2 = poly[(j + 1) % n];
+      if (segmentsProperlyIntersect(a1, a2, b1, b2)) return true;
+    }
+  }
+  return false;
+}
+
+export function sanitizeBorderPolygon(
+  rawVertices: Vec2[] | undefined,
+  halfSize = 22,
+  fallbackSeed = 1,
+): Vec2[] {
+  if (!Array.isArray(rawVertices) || rawVertices.length < 3) {
+    return createProceduralArenaPolygon('crater', halfSize, fallbackSeed);
+  }
+
+  const cleaned: Vec2[] = [];
+  for (const v of rawVertices.slice(0, 32)) {
+    const x = Number(v?.x);
+    const z = Number(v?.z);
+    if (!Number.isFinite(x) || !Number.isFinite(z)) continue;
+    const clamped = {
+      x: Number(Math.max(-halfSize, Math.min(halfSize, x)).toFixed(2)),
+      z: Number(Math.max(-halfSize, Math.min(halfSize, z)).toFixed(2)),
+    };
+    const prev = cleaned[cleaned.length - 1];
+    if (!prev || Math.hypot(clamped.x - prev.x, clamped.z - prev.z) >= 0.45) {
+      cleaned.push(clamped);
+    }
+  }
+
+  if (
+    cleaned.length > 3 &&
+    Math.hypot(
+      cleaned[0].x - cleaned[cleaned.length - 1].x,
+      cleaned[0].z - cleaned[cleaned.length - 1].z,
+    ) < 0.45
+  ) {
+    cleaned.pop();
+  }
+
+  if (
+    cleaned.length >= 3 &&
+    !hasSelfIntersection(cleaned) &&
+    Math.abs(computePolygonSignedArea(cleaned)) >= 280
+  ) {
+    return cleaned;
+  }
+
+  // Attempt radial angular sort around centroid if vertices were unordered
+  if (cleaned.length >= 3) {
+    const cx = cleaned.reduce((s, p) => s + p.x, 0) / cleaned.length;
+    const cz = cleaned.reduce((s, p) => s + p.z, 0) / cleaned.length;
+    const sorted = [...cleaned].sort(
+      (a, b) => Math.atan2(a.z - cz, a.x - cx) - Math.atan2(b.z - cz, b.x - cx),
+    );
+    if (!hasSelfIntersection(sorted) && Math.abs(computePolygonSignedArea(sorted)) >= 280) {
+      return sorted;
+    }
+  }
+
+  return createProceduralArenaPolygon('crater', halfSize, fallbackSeed);
+}
+
+export function computeSafePolygonSpawns(
+  borderPolygon: Vec2[],
+  halfSize = 22,
+  suggestedSpawns?: Array<{ x: number; z: number }>,
+): SpawnPoint[] {
+  const labels = ['Alpha Pad', 'Beta Pad', 'Gamma Pad', 'Delta Pad'];
+
+  for (const clearance of [2.6, 1.9, 1.3]) {
+    const candidates: Vec2[] = [];
+    if (Array.isArray(suggestedSpawns)) {
+      for (const s of suggestedSpawns) {
+        if (!Number.isFinite(s?.x) || !Number.isFinite(s?.z)) continue;
+        const pt = { x: Number(s.x), z: Number(s.z) };
+        if (
+          pointInPolygon(pt, borderPolygon) &&
+          distanceToPolygonBorder(pt, borderPolygon).dist >= clearance
+        ) {
+          candidates.push(pt);
+        }
+      }
+    }
+
+    const step = 2.2;
+    for (let x = -halfSize + 2; x <= halfSize - 2; x += step) {
+      for (let z = -halfSize + 2; z <= halfSize - 2; z += step) {
+        const pt = { x: Number(x.toFixed(2)), z: Number(z.toFixed(2)) };
+        if (
+          pointInPolygon(pt, borderPolygon) &&
+          distanceToPolygonBorder(pt, borderPolygon).dist >= clearance
+        ) {
+          candidates.push(pt);
+        }
+      }
+    }
+
+    if (candidates.length >= 4) {
+      const chosen: Vec2[] = [];
+      // Start with first valid suggested spawn, or the candidate farthest from center
+      let first = candidates[0];
+      if (!suggestedSpawns || suggestedSpawns.length === 0) {
+        let bestCenterDist = -1;
+        for (const c of candidates) {
+          const d = Math.hypot(c.x, c.z);
+          if (d > bestCenterDist) {
+            bestCenterDist = d;
+            first = c;
+          }
+        }
+      }
+      chosen.push(first);
+
+      while (chosen.length < 4) {
+        let bestPt = candidates[0];
+        let bestMinDist = -1;
+        for (const c of candidates) {
+          let minD = Infinity;
+          for (const picked of chosen) {
+            const d = Math.hypot(c.x - picked.x, c.z - picked.z);
+            if (d < minD) minD = d;
+          }
+          if (minD > bestMinDist) {
+            bestMinDist = minD;
+            bestPt = c;
+          }
+        }
+        chosen.push(bestPt);
+      }
+
+      return chosen.map((pt, idx) => ({
+        index: idx,
+        x: pt.x,
+        y: 0,
+        z: pt.z,
+        yaw: Number(Math.atan2(-pt.z, -pt.x).toFixed(3)),
+        color: SPAWN_COLORS[idx % SPAWN_COLORS.length],
+        label: labels[idx],
+      }));
+    }
+  }
+
+  return createDefaultSpawnPoints(halfSize);
+}
+
 export function createDefaultSpawnPoints(halfSize = 22): SpawnPoint[] {
-  const offset = halfSize - 4;
+  const offset = halfSize - 6.5;
   return [
     {
       index: 0,
       x: -offset,
       y: 0,
-      z: -offset,
+      z: -offset * 0.55,
       yaw: 0,
       color: SPAWN_COLORS[0],
       label: 'NW Pad',
@@ -173,14 +522,14 @@ export function createDefaultSpawnPoints(halfSize = 22): SpawnPoint[] {
       index: 1,
       x: offset,
       y: 0,
-      z: offset,
+      z: offset * 0.55,
       yaw: Math.PI,
       color: SPAWN_COLORS[1],
       label: 'SE Pad',
     },
     {
       index: 2,
-      x: offset,
+      x: offset * 0.55,
       y: 0,
       z: -offset,
       yaw: Math.PI * 0.5,
@@ -189,7 +538,7 @@ export function createDefaultSpawnPoints(halfSize = 22): SpawnPoint[] {
     },
     {
       index: 3,
-      x: -offset,
+      x: -offset * 0.55,
       y: 0,
       z: offset,
       yaw: Math.PI * 1.5,
@@ -201,10 +550,14 @@ export function createDefaultSpawnPoints(halfSize = 22): SpawnPoint[] {
 
 export function createDefaultArenaConfig(): ArenaConfig {
   const halfSize = 22;
+  const borderPolygon = createProceduralArenaPolygon('octagon', halfSize, 1);
+  const spawnPoints = computeSafePolygonSpawns(borderPolygon, halfSize);
   return {
-    name: 'Foundry Sector 04',
-    tagline: 'Symmetrical top-down laser crucible with sightline pillars',
+    name: 'Octa-Bastion 04',
+    tagline: 'Chamfered octagonal laser crucible with sightline pillars',
     halfSize,
+    borderShapeName: 'Octagonal Bastion',
+    borderPolygon,
     palette: {
       skyColor: '#0b1018',
       fogColor: '#111827',
@@ -220,17 +573,17 @@ export function createDefaultArenaConfig(): ArenaConfig {
       speedMultiplier: 1,
       damageMultiplier: 1,
     },
-    spawnPoints: createDefaultSpawnPoints(halfSize),
+    spawnPoints,
     obstacles: [
-      { id: 'center-monolith', x: 0, z: 0, width: 3.6, depth: 3.6, height: 4.0, kind: 'monolith' },
-      { id: 'north-wall', x: 0, z: -10.5, width: 6.4, depth: 1.6, height: 2.6, kind: 'barrier' },
-      { id: 'south-wall', x: 0, z: 10.5, width: 6.4, depth: 1.6, height: 2.6, kind: 'barrier' },
-      { id: 'east-wall', x: 10.5, z: 0, width: 1.6, depth: 6.4, height: 2.6, kind: 'barrier' },
-      { id: 'west-wall', x: -10.5, z: 0, width: 1.6, depth: 6.4, height: 2.6, kind: 'barrier' },
-      { id: 'nw-pillar', x: -8.2, z: -8.2, width: 2.4, depth: 2.4, height: 3.2, kind: 'pillar' },
-      { id: 'ne-pillar', x: 8.2, z: -8.2, width: 2.4, depth: 2.4, height: 3.2, kind: 'pillar' },
-      { id: 'sw-pillar', x: -8.2, z: 8.2, width: 2.4, depth: 2.4, height: 3.2, kind: 'pillar' },
-      { id: 'se-pillar', x: 8.2, z: 8.2, width: 2.4, depth: 2.4, height: 3.2, kind: 'pillar' },
+      { id: 'center-monolith', x: 0, z: 0, width: 3.4, depth: 3.4, height: 4.0, kind: 'monolith' },
+      { id: 'north-wall', x: 0, z: -9.5, width: 5.8, depth: 1.5, height: 2.6, kind: 'barrier' },
+      { id: 'south-wall', x: 0, z: 9.5, width: 5.8, depth: 1.5, height: 2.6, kind: 'barrier' },
+      { id: 'east-wall', x: 9.5, z: 0, width: 1.5, depth: 5.8, height: 2.6, kind: 'barrier' },
+      { id: 'west-wall', x: -9.5, z: 0, width: 1.5, depth: 5.8, height: 2.6, kind: 'barrier' },
+      { id: 'nw-pillar', x: -6.8, z: -6.8, width: 2.2, depth: 2.2, height: 3.2, kind: 'pillar' },
+      { id: 'ne-pillar', x: 6.8, z: -6.8, width: 2.2, depth: 2.2, height: 3.2, kind: 'pillar' },
+      { id: 'sw-pillar', x: -6.8, z: 6.8, width: 2.2, depth: 2.2, height: 3.2, kind: 'pillar' },
+      { id: 'se-pillar', x: 6.8, z: 6.8, width: 2.2, depth: 2.2, height: 3.2, kind: 'pillar' },
     ],
   };
 }
@@ -239,28 +592,88 @@ export function sanitizeArenaObstacles(
   obstacles: ObstacleSpec[],
   spawnPoints: SpawnPoint[],
   halfSize: number,
+  borderPolygon?: Vec2[],
 ): ObstacleSpec[] {
-  const limit = halfSize - 2.6;
+  const limit = halfSize - 2.2;
+  const hasPoly = Boolean(borderPolygon && borderPolygon.length >= 3);
+
   return obstacles
+    .map((obs, idx) => ({
+      ...obs,
+      id: obs.id || `obs-${idx}`,
+      width: Math.max(1.2, Math.min(8.5, Number(obs.width) || 2.4)),
+      depth: Math.max(1.2, Math.min(8.5, Number(obs.depth) || 2.4)),
+      height: Math.max(1.2, Math.min(5, Number(obs.height) || 2.5)),
+    }))
     .filter((obs) => {
       if (Math.abs(obs.x) > limit || Math.abs(obs.z) > limit) return false;
+
+      if (hasPoly && borderPolygon) {
+        const hw = obs.width * 0.5 + 0.8;
+        const hd = obs.depth * 0.5 + 0.8;
+        const testPts: Vec2[] = [
+          { x: obs.x, z: obs.z },
+          { x: obs.x - hw, z: obs.z - hd },
+          { x: obs.x + hw, z: obs.z - hd },
+          { x: obs.x - hw, z: obs.z + hd },
+          { x: obs.x + hw, z: obs.z + hd },
+        ];
+        if (!testPts.every((p) => pointInPolygon(p, borderPolygon))) {
+          return false;
+        }
+      }
+
       for (const sp of spawnPoints) {
-        const minClearX = obs.width * 0.5 + 3.4;
-        const minClearZ = obs.depth * 0.5 + 3.4;
+        const minClearX = obs.width * 0.5 + 2.9;
+        const minClearZ = obs.depth * 0.5 + 2.9;
         if (Math.abs(obs.x - sp.x) < minClearX && Math.abs(obs.z - sp.z) < minClearZ) {
           return false;
         }
       }
       return true;
     })
-    .slice(0, 16)
-    .map((obs, idx) => ({
-      ...obs,
-      id: obs.id || `obs-${idx}`,
-      width: Math.max(1.4, Math.min(8, obs.width)),
-      depth: Math.max(1.4, Math.min(8, obs.depth)),
-      height: Math.max(1.2, Math.min(5, obs.height || 2.5)),
-    }));
+    .slice(0, 20);
+}
+
+function constrainCircleInsidePolygon(x: number, z: number, radius: number, poly: Vec2[]): Vec2 {
+  let cx = x;
+  let cz = z;
+
+  if (!pointInPolygon({ x: cx, z: cz }, poly)) {
+    const info = distanceToPolygonBorder({ x: cx, z: cz }, poly);
+    cx = info.closest.x + info.edgeNormalInward.x * (radius + 0.06);
+    cz = info.closest.z + info.edgeNormalInward.z * (radius + 0.06);
+  }
+
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    const seg = closestPointOnSegment(cx, cz, a.x, a.z, b.x, b.z);
+    if (seg.distSq < radius * radius) {
+      const dist = Math.sqrt(seg.distSq);
+      if (dist > 1e-6) {
+        const push = radius - dist;
+        const candX = cx + ((cx - seg.x) / dist) * push;
+        const candZ = cz + ((cz - seg.z) / dist) * push;
+        if (pointInPolygon({ x: candX, z: candZ }, poly)) {
+          cx = candX;
+          cz = candZ;
+        } else {
+          const edx = b.x - a.x;
+          const edz = b.z - a.z;
+          const elen = Math.max(1e-6, Math.hypot(edx, edz));
+          const n1 = { x: -edz / elen, z: edx / elen };
+          const n2 = { x: edz / elen, z: -edx / elen };
+          const test = { x: seg.x + n1.x * 0.3, z: seg.z + n1.z * 0.3 };
+          const inward = pointInPolygon(test, poly) ? n1 : n2;
+          cx = seg.x + inward.x * radius;
+          cz = seg.z + inward.z * radius;
+        }
+      }
+    }
+  }
+
+  return { x: cx, z: cz };
 }
 
 export function resolveTopDownCollision(
@@ -268,9 +681,20 @@ export function resolveTopDownCollision(
   radius: number,
   halfSize: number,
   obstacles: ObstacleSpec[],
+  borderPolygon?: Vec2[],
 ): Vec2 {
-  let x = Math.max(-halfSize + radius, Math.min(halfSize - radius, pos.x));
-  let z = Math.max(-halfSize + radius, Math.min(halfSize - radius, pos.z));
+  const hasPoly = Boolean(borderPolygon && borderPolygon.length >= 3);
+  let x = pos.x;
+  let z = pos.z;
+
+  if (hasPoly && borderPolygon) {
+    const inside = constrainCircleInsidePolygon(x, z, radius, borderPolygon);
+    x = inside.x;
+    z = inside.z;
+  } else {
+    x = Math.max(-halfSize + radius, Math.min(halfSize - radius, x));
+    z = Math.max(-halfSize + radius, Math.min(halfSize - radius, z));
+  }
 
   for (const obs of obstacles) {
     const halfW = obs.width * 0.5;
@@ -298,6 +722,10 @@ export function resolveTopDownCollision(
         }
       }
     }
+  }
+
+  if (hasPoly && borderPolygon) {
+    return constrainCircleInsidePolygon(x, z, radius, borderPolygon);
   }
 
   x = Math.max(-halfSize + radius, Math.min(halfSize - radius, x));
@@ -374,6 +802,44 @@ export function intersectSegmentWithObstacles(
   };
 }
 
+export function intersectSegmentWithPolygonBorder(
+  px: number,
+  pz: number,
+  nx: number,
+  nz: number,
+  poly: Vec2[],
+): Vec2 | null {
+  const dx = nx - px;
+  const dz = nz - pz;
+  let bestT: number | null = null;
+
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    const ex = b.x - a.x;
+    const ez = b.z - a.z;
+    const denom = dx * ez - dz * ex;
+    if (Math.abs(denom) < 1e-9) continue;
+
+    const t = ((a.x - px) * ez - (a.z - pz) * ex) / denom;
+    const u = ((a.x - px) * dz - (a.z - pz) * dx) / denom;
+    if (t >= -1e-4 && t <= 1 && u >= -1e-4 && u <= 1.0001) {
+      const hitT = Math.max(0, t);
+      if (bestT === null || hitT < bestT) {
+        bestT = hitT;
+      }
+    }
+  }
+
+  if (bestT !== null) {
+    return {
+      x: px + dx * bestT,
+      z: pz + dz * bestT,
+    };
+  }
+  return null;
+}
+
 export interface LaserTargetCircle {
   id: string;
   x: number;
@@ -390,7 +856,7 @@ export interface TracedLaserResult {
 /**
  * Traces a straight (curvature = 0) or curved (curvature != 0) laser beam in top-down 2D space
  * starting at the perimeter of the player's circle and marching up to `maxRange`.
- * Stops at outer arena boundaries or solid obstacles, and detects intersections with enemy circles.
+ * Stops at custom polygon borders (or outer square fallback) and solid obstacles, and detects enemy circle hits.
  */
 export function traceCurvedLaserBeam(params: {
   origin: Vec2;
@@ -399,6 +865,7 @@ export function traceCurvedLaserBeam(params: {
   point: LaserShootingPoint;
   maxRange: number;
   halfSize: number;
+  borderPolygon?: Vec2[];
   obstacles: ObstacleSpec[];
   targets: LaserTargetCircle[];
 }): TracedLaserResult {
@@ -409,10 +876,12 @@ export function traceCurvedLaserBeam(params: {
     point,
     maxRange,
     halfSize,
+    borderPolygon,
     obstacles,
     targets,
   } = params;
 
+  const hasPoly = Boolean(borderPolygon && borderPolygon.length >= 3);
   const startAngle = baseSpinRad + (point.angleDeg * Math.PI) / 180;
   let px = origin.x + Math.cos(startAngle) * emitterRadius;
   let pz = origin.z + Math.sin(startAngle) * emitterRadius;
@@ -432,8 +901,21 @@ export function traceCurvedLaserBeam(params: {
     const nx = px + Math.cos(theta) * actualStep;
     const nz = pz + Math.sin(theta) * actualStep;
 
-    // Check outer wall collision
-    if (Math.abs(nx) >= halfSize || Math.abs(nz) >= halfSize) {
+    // Check custom polygon border or outer square boundary
+    if (hasPoly && borderPolygon) {
+      const polyHit = intersectSegmentWithPolygonBorder(px, pz, nx, nz, borderPolygon);
+      if (polyHit) {
+        points.push(polyHit);
+        impactPoint = polyHit;
+        break;
+      }
+      if (!pointInPolygon({ x: nx, z: nz }, borderPolygon)) {
+        const edge = distanceToPolygonBorder({ x: nx, z: nz }, borderPolygon).closest;
+        points.push(edge);
+        impactPoint = edge;
+        break;
+      }
+    } else if (Math.abs(nx) >= halfSize || Math.abs(nz) >= halfSize) {
       const clampedX = Math.max(-halfSize, Math.min(halfSize, nx));
       const clampedZ = Math.max(-halfSize, Math.min(halfSize, nz));
       points.push({ x: clampedX, z: clampedZ });
