@@ -9,9 +9,7 @@ interface GameHudProps {
   phase: GamePhase;
   hud: PlayerHudState;
   tutorial: TutorialState;
-  roomCode: string;
-  playerCount: number;
-  webrtcPeers: number;
+  botsEnabled: boolean;
   killFeed: KillFeedItem[];
   muted: boolean;
   cameraActive: boolean;
@@ -35,9 +33,7 @@ export const GameHud: React.FC<GameHudProps> = ({
   phase,
   hud,
   tutorial,
-  roomCode,
-  playerCount,
-  webrtcPeers,
+  botsEnabled,
   killFeed,
   muted,
   cameraActive,
@@ -130,9 +126,9 @@ export const GameHud: React.FC<GameHudProps> = ({
             <div className="h-7 w-px bg-slate-700/80 hidden sm:block" />
 
             <div className="hidden sm:block text-left text-xs text-slate-300 font-mono-num">
-              <div>{roomCode ? `Room ${roomCode}` : 'Solo + Bots'}</div>
+              <div data-testid="hud-mode-label">Single Player</div>
               <div className="text-[11px] text-slate-400">
-                {Math.max(1, playerCount)}/4 Pilots{webrtcPeers > 0 ? ` · P2P (${webrtcPeers})` : ''}
+                {botsEnabled ? 'vs 3 AI Bots' : 'Solo Practice'}
               </div>
             </div>
           </div>

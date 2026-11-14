@@ -2,8 +2,6 @@ import React, { useState } from 'react';
 import {
   ArrowLeftRight,
   Camera,
-  Check,
-  Copy,
   Crosshair,
   GraduationCap,
   Hand,
@@ -12,7 +10,6 @@ import {
   Play,
   Shuffle,
   Sparkles,
-  Users,
   Video,
 } from 'lucide-react';
 import { PRESET_SHOOT_GESTURES } from '../game/gestures';
@@ -21,17 +18,11 @@ import type {
   ArenaConfig,
   CustomShootGestureSpec,
   LaserGunConfig,
-  RoomPlayerState,
 } from '../game/types';
 
 interface TitleOverlayProps {
   playerName: string;
   onPlayerNameChange: (name: string) => void;
-  roomCodeInput: string;
-  onRoomCodeInputChange: (code: string) => void;
-  activeRoomCode: string;
-  players: RoomPlayerState[];
-  isHost: boolean;
   arena: ArenaConfig;
   gun: LaserGunConfig;
   shootGesture: CustomShootGestureSpec;
@@ -46,8 +37,6 @@ interface TitleOverlayProps {
   onDescribeAiGesture: (prompt: string) => Promise<void>;
   onRecordLiveGesture: () => CustomShootGestureSpec | null;
   onToggleBots: () => void;
-  onCreateRoom: () => void;
-  onJoinRoom: () => void;
   onToggleCamera: () => void;
   onToggleSwapHands: () => void;
   onToggleVoice: () => void;
@@ -182,11 +171,6 @@ const SHAPE_PRESET_PROMPTS = [
 export const TitleOverlay: React.FC<TitleOverlayProps> = ({
   playerName,
   onPlayerNameChange,
-  roomCodeInput,
-  onRoomCodeInputChange,
-  activeRoomCode,
-  players,
-  isHost,
   arena,
   gun,
   shootGesture,
@@ -201,8 +185,6 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
   onDescribeAiGesture,
   onRecordLiveGesture,
   onToggleBots,
-  onCreateRoom,
-  onJoinRoom,
   onToggleCamera,
   onToggleSwapHands,
   onToggleVoice,
@@ -229,8 +211,6 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
   const [gesturePrompt, setGesturePrompt] = useState('Two-finger peace sign');
   const [isCompilingGesture, setIsCompilingGesture] = useState(false);
   const [gestureFeedback, setGestureFeedback] = useState('');
-
-  const [copiedCode, setCopiedCode] = useState(false);
 
   const handleForgeGun = async () => {
     if (!gunPrompt.trim()) {
@@ -305,14 +285,6 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
     }
   };
 
-  const handleCopyInvite = () => {
-    if (!activeRoomCode) return;
-    const url = `${location.origin}/?room=${activeRoomCode}`;
-    void navigator.clipboard?.writeText(url);
-    setCopiedCode(true);
-    setTimeout(() => setCopiedCode(false), 1800);
-  };
-
   return (
     <div className="fixed inset-0 z-20 flex flex-col justify-between p-5 md:p-8 pointer-events-none select-none">
       {/* Measured left-side scrim ensuring >=4.5:1 text contrast while keeping spinning showcase clear */}
@@ -354,19 +326,19 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
                 LASER PALM
               </h1>
               <p className="text-xs text-slate-300 mt-1">
-                Top-Down Spinning Laser Arena · Webcam Face Avatar · AI Gun &amp; Level Forge
+                Single-Player Spinning Laser Arena · Webcam Face Avatar · AI Gun &amp; Level Forge
               </p>
             </div>
           </div>
 
-          {/* Room & Roster Bar */}
+          {/* Single-Player Pilot & Arena Mode Bar */}
           <div
             className="p-3.5 rounded-lg border border-slate-700/70 flex flex-col gap-2.5"
             style={{ backgroundColor: 'rgba(13, 18, 28, 0.92)' }}
           >
-            <div className="flex items-end gap-2.5">
+            <div className="flex flex-col sm:flex-row sm:items-end gap-2.5">
               <label className="text-xs font-medium text-slate-300 flex-1">
-                Callsign
+                Pilot Callsign
                 <input
                   type="text"
                   value={playerName}
@@ -377,68 +349,52 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
                 />
               </label>
 
-              <label className="text-xs font-medium text-slate-300 w-24">
-                Room Code
-                <input
-                  type="text"
-                  value={roomCodeInput}
-                  onChange={(e) => onRoomCodeInputChange(e.target.value.toUpperCase())}
-                  maxLength={6}
-                  className="mt-1 w-full px-2.5 py-1.5 text-xs font-mono-num uppercase bg-slate-900 border border-slate-700 rounded text-white focus:outline-none focus:border-sky-400"
-                  placeholder="ABCD"
-                />
-              </label>
-
-              <button
-                type="button"
-                onClick={onCreateRoom}
-                className="px-3 py-1.5 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-white border border-slate-600 rounded transition-colors cursor-pointer whitespace-nowrap shrink-0"
-              >
-                Create Room
-              </button>
-              <button
-                type="button"
-                onClick={onJoinRoom}
-                className="px-3 py-1.5 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-white border border-slate-600 rounded transition-colors cursor-pointer whitespace-nowrap shrink-0"
-              >
-                Join
-              </button>
-            </div>
-
-            <div className="flex items-center justify-between pt-2 border-t border-slate-800 text-xs text-slate-300">
-              <div className="flex items-center gap-2 min-w-0">
-                <Users className="w-3.5 h-3.5 text-sky-400 shrink-0" />
-                <span className="font-mono-num whitespace-nowrap">
-                  {Math.max(1, players.length)} / 4 Players
-                </span>
-                <span className="text-slate-500">·</span>
-                <span className="text-slate-400 truncate">
-                  {players.length > 0 ? players.map((p) => p.name).join(', ') : 'Solo + AI Bots Ready'}
-                </span>
-              </div>
-
-              <div className="flex items-center gap-3 shrink-0">
-                {activeRoomCode && (
+              <div className="flex flex-col gap-1">
+                <span className="text-xs font-medium text-slate-300">Arena Mode</span>
+                <div className="grid grid-cols-2 gap-1 p-0.5 bg-slate-950 rounded border border-slate-800">
                   <button
                     type="button"
-                    onClick={handleCopyInvite}
-                    className="flex items-center gap-1 px-2 py-0.5 text-xs font-mono-num text-sky-300 bg-sky-950/60 hover:bg-sky-900/60 border border-sky-700/50 rounded cursor-pointer whitespace-nowrap"
+                    onClick={() => {
+                      if (!botsEnabled) onToggleBots();
+                    }}
+                    className={`px-3 py-1 text-xs font-semibold rounded transition-colors cursor-pointer whitespace-nowrap ${
+                      botsEnabled
+                        ? 'bg-sky-500 text-slate-950'
+                        : 'text-slate-300 hover:text-white'
+                    }`}
                   >
-                    {copiedCode ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
-                    <span>{activeRoomCode}</span>
+                    vs 3 AI Bots
                   </button>
-                )}
-
-                <label className="flex items-center gap-1.5 cursor-pointer text-slate-300 whitespace-nowrap">
-                  <input
-                    type="checkbox"
-                    checked={botsEnabled}
-                    onChange={onToggleBots}
-                    className="accent-sky-400"
-                  />
-                  <span>AI Bots</span>
-                </label>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (botsEnabled) onToggleBots();
+                    }}
+                    className={`px-3 py-1 text-xs font-semibold rounded transition-colors cursor-pointer whitespace-nowrap ${
+                      !botsEnabled
+                        ? 'bg-amber-400 text-slate-950'
+                        : 'text-slate-300 hover:text-white'
+                    }`}
+                  >
+                    Solo Practice
+                  </button>
+                </div>
               </div>
+            </div>
+
+            <div className="flex items-center justify-between pt-2 border-t border-slate-800 text-xs text-slate-400">
+              <div className="flex items-center gap-1.5 min-w-0 truncate">
+                <span className="text-slate-200 font-medium whitespace-nowrap">Single Player</span>
+                <span aria-hidden="true">·</span>
+                <span className="truncate">
+                  {botsEnabled
+                    ? 'Rivals: Viper Lance · Helix Orbiter · Nova Charger'
+                    : 'Target Practice (AI Bot Rivals Off)'}
+                </span>
+              </div>
+              <span className="font-mono-num text-slate-300 whitespace-nowrap shrink-0">
+                2:00 Sprint
+              </span>
             </div>
           </div>
 
@@ -584,14 +540,13 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
                     aria-label="Describe custom arena shape, level layout, and theme"
                     value={arenaTheme}
                     onChange={(e) => setArenaTheme(e.target.value)}
-                    disabled={!isHost && Boolean(activeRoomCode)}
-                    className="flex-1 px-3 py-1.5 text-xs bg-slate-900 border border-slate-700 rounded text-white focus:outline-none focus:border-sky-400 disabled:opacity-60"
+                    className="flex-1 px-3 py-1.5 text-xs bg-slate-900 border border-slate-700 rounded text-white focus:outline-none focus:border-sky-400"
                     placeholder="Any border shape & level (e.g. star fortress, crescent maze)..."
                   />
                   <button
                     type="button"
                     onClick={() => void handleGenerateLevel(undefined, false)}
-                    disabled={isGeneratingArena || (!isHost && Boolean(activeRoomCode))}
+                    disabled={isGeneratingArena}
                     className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-sky-400 hover:bg-sky-300 disabled:opacity-50 text-slate-950 rounded transition-colors cursor-pointer whitespace-nowrap shrink-0"
                   >
                     <Sparkles className="w-3.5 h-3.5" />
@@ -600,7 +555,7 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
                   <button
                     type="button"
                     onClick={() => void handleGenerateLevel('', true)}
-                    disabled={isGeneratingArena || (!isHost && Boolean(activeRoomCode))}
+                    disabled={isGeneratingArena}
                     className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-semibold bg-amber-400/20 hover:bg-amber-400/30 disabled:opacity-50 border border-amber-400/70 text-amber-200 rounded transition-colors cursor-pointer whitespace-nowrap shrink-0"
                   >
                     <Shuffle className="w-3.5 h-3.5" />
@@ -613,7 +568,7 @@ export const TitleOverlay: React.FC<TitleOverlayProps> = ({
                     <button
                       key={item.label}
                       type="button"
-                      disabled={isGeneratingArena || (!isHost && Boolean(activeRoomCode))}
+                      disabled={isGeneratingArena}
                       onClick={() => {
                         setArenaTheme(item.prompt);
                         void handleGenerateLevel(item.prompt, false);

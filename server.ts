@@ -12,12 +12,8 @@ import {
   type LiveServerMessage,
 } from '@google/genai';
 import {
-  applyDamageAndRespawn,
   computeSafePolygonSpawns,
   createDefaultArenaConfig,
-  createDefaultLaserGun,
-  MATCH_DURATION_SEC,
-  MAX_PLAYERS_PER_ROOM,
   sanitizeArenaObstacles,
   sanitizeBorderPolygon,
   sanitizeLaserGunConfig,
@@ -30,14 +26,29 @@ import type {
   LaserGunConfig,
   MatchTelemetry,
   ObstacleSpec,
-  RoomPlayerState,
   Vec2,
 } from './src/game/types.ts';
 
 const isProduction = process.env.NODE_ENV === 'production';
 const PORT = isProduction ? Number(process.env.PORT || 3000) : 3000;
 
-function getAiClient(apiVersion: 'v1beta' | 'v1alpha' = 'v1beta'): GoogleGenAI {
+/**
+ * Verified model identifiers from the Build with Gemini 4 Hackathon Builder Guide.
+ * Note: Never pass custom temperature, topP, topK, thinkingBudget, or 'minimal'
+ * thinkingLevel to Gemini 4 models; declare native responseSchema / function tools.
+ */
+export const MODEL_IDS = {
+  fast_workhorse: 'gemini-4-hydrogen',
+  frontier_deep: 'gemini-4-carbon',
+  frontier_efficient: 'gemini-4-argon',
+  decisions: 'gemini-decision-1',
+  live_voice_vision: 'gemini-3.8-live',
+  tts_studio: 'gemini-3.8-flash-tts',
+  image_default: 'gemini-nano-banana-2.1',
+  image_fast: 'gemini-3.1-flash-lite-image',
+} as const;
+
+function getAiClient(apiVersion?: 'v1beta' | 'v1alpha'): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY is not configured in the environment.');
@@ -45,7 +56,7 @@ function getAiClient(apiVersion: 'v1beta' | 'v1alpha' = 'v1beta'): GoogleGenAI {
   return new GoogleGenAI({
     apiKey,
     httpOptions: {
-      apiVersion,
+      ...(apiVersion ? { apiVersion } : {}),
       headers: {
         'User-Agent': 'aistudio-build',
       },
@@ -81,7 +92,7 @@ async function generateNanoBananaTexture(
   prompt: string,
 ): Promise<string | null> {
   const response = await ai.models.generateContent({
-    model: 'gemini-3.1-flash-lite-image',
+    model: MODEL_IDS.image_fast,
     contents: {
       parts: [{ text: prompt }],
     },
@@ -99,131 +110,6 @@ async function generateNanoBananaTexture(
     }
   }
   return null;
-}
-
-// --- In-memory Multiplayer Rooms (up to 4 players, 2-minute match) ---
-interface ClientMeta {
-  ws: WebSocket;
-  id: string;
-  roomCode: string;
-}
-
-interface GameRoom {
-  code: string;
-  hostId: string;
-  arena: ArenaConfig;
-  matchState: 'lobby' | 'playing' | 'ended';
-  timeRemainingSec: number;
-  players: Map<string, RoomPlayerState>;
-  sockets: Map<string, WebSocket>;
-  timerHandle: ReturnType<typeof setInterval> | null;
-}
-
-const rooms = new Map<string, GameRoom>();
-
-function generateRoomCode(): string {
-  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 4; i++) {
-    code += chars.charCodeAt(Math.floor(Math.random() * chars.length))
-      ? chars[Math.floor(Math.random() * chars.length)]
-      : 'A';
-  }
-  return rooms.has(code) ? generateRoomCode() : code;
-}
-
-function broadcastToRoom(room: GameRoom, payload: unknown, excludeId?: string) {
-  const raw = JSON.stringify(payload);
-  for (const [pid, sock] of room.sockets.entries()) {
-    if (excludeId && pid === excludeId) continue;
-    if (sock.readyState === WebSocket.OPEN) {
-      sock.send(raw);
-    }
-  }
-}
-
-function serializeRoom(room: GameRoom) {
-  return {
-    code: room.code,
-    hostId: room.hostId,
-    matchState: room.matchState,
-    timeRemainingSec: room.timeRemainingSec,
-    arena: room.arena,
-    players: Array.from(room.players.values()),
-  };
-}
-
-function startRoomTimer(room: GameRoom) {
-  if (room.timerHandle) {
-    clearInterval(room.timerHandle);
-  }
-  room.matchState = 'playing';
-  room.timeRemainingSec = MATCH_DURATION_SEC;
-
-  for (const [pid, p] of room.players.entries()) {
-    const sp = room.arena.spawnPoints[p.spawnIndex % room.arena.spawnPoints.length];
-    room.players.set(pid, {
-      ...p,
-      x: sp.x,
-      y: 0,
-      z: sp.z,
-      yaw: sp.yaw,
-      pitch: 0,
-      hp: 100,
-      kills: 0,
-      deaths: 0,
-      alive: true,
-    });
-  }
-
-  broadcastToRoom(room, {
-    type: 'match_started',
-    room: serializeRoom(room),
-  });
-
-  room.timerHandle = setInterval(() => {
-    if (room.matchState !== 'playing') {
-      if (room.timerHandle) clearInterval(room.timerHandle);
-      room.timerHandle = null;
-      return;
-    }
-    room.timeRemainingSec = Math.max(0, room.timeRemainingSec - 1);
-    broadcastToRoom(room, {
-      type: 'timer_tick',
-      timeRemainingSec: room.timeRemainingSec,
-    });
-    if (room.timeRemainingSec <= 0) {
-      room.matchState = 'ended';
-      if (room.timerHandle) clearInterval(room.timerHandle);
-      room.timerHandle = null;
-      broadcastToRoom(room, {
-        type: 'match_ended',
-        room: serializeRoom(room),
-      });
-    }
-  }, 1000);
-}
-
-function removePlayerFromRoom(meta: ClientMeta) {
-  const room = rooms.get(meta.roomCode);
-  if (!room) return;
-  room.players.delete(meta.id);
-  room.sockets.delete(meta.id);
-  if (room.players.size === 0) {
-    if (room.timerHandle) clearInterval(room.timerHandle);
-    rooms.delete(room.code);
-    return;
-  }
-  if (room.hostId === meta.id) {
-    const nextHost = room.players.keys().next().value;
-    if (nextHost) room.hostId = nextHost;
-  }
-  broadcastToRoom(room, {
-    type: 'player_left',
-    playerId: meta.id,
-    hostId: room.hostId,
-    players: Array.from(room.players.values()),
-  });
 }
 
 async function bootstrap() {
@@ -262,7 +148,7 @@ async function bootstrap() {
       const ai = getAiClient();
 
       const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+        model: MODEL_IDS.fast_workhorse,
         contents: `Design a custom laser emitter configuration for a top-down spinning circle shooter game based on this player request:
 "${descriptionPrompt}"
 
@@ -328,7 +214,7 @@ Rules of the game:
       const ai = getAiClient();
 
       const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
+        model: MODEL_IDS.fast_workhorse,
         contents: `Translate this player description of a single-hand webcam gesture into finger extension/curl rules for a real-time 21-landmark hand tracker:
 "${gesturePrompt}"
 
@@ -425,8 +311,8 @@ Examples:
       const halfSize = 22;
 
       const layoutPromise = ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: `Design a complete top-down 2D multiplayer laser arena level—including a custom NON-SQUARE outer map border polygon and tactical interior obstacles—for up to 4 spinning circle players inside a 44m x 44m coordinate space (X and Z from -21 to +21).
+        model: MODEL_IDS.fast_workhorse,
+        contents: `Design a complete top-down 2D single-player laser arena level—including a custom NON-SQUARE outer map border polygon and tactical interior obstacles—for a spinning circle pilot facing 3 AI bot rivals inside a 44m x 44m coordinate space (X and Z from -21 to +21).
 
 Level Request / Theme: "${theme}"
 
@@ -691,15 +577,9 @@ CRITICAL GEOMETRY RULES:
         res.status(500).json({ error: 'GEMINI_API_KEY is not configured in the environment.' });
         return;
       }
-      const ttsAi = new GoogleGenAI({
-        apiKey,
-        httpOptions: {
-          apiVersion: 'v1alpha',
-          headers: { 'User-Agent': 'aistudio-build' },
-        },
-      });
+      const ttsAi = getAiClient('v1alpha');
       const response = await ttsAi.models.generateContent({
-        model: 'gemini-3.8-flash-tts',
+        model: MODEL_IDS.tts_studio,
         contents: [
           {
             role: 'user',
@@ -759,8 +639,8 @@ CRITICAL GEOMETRY RULES:
           : 0;
 
       const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: `Analyze this 2-minute top-down spinning laser arena match and produce a punchy tactical scouting report.
+        model: MODEL_IDS.fast_workhorse,
+        contents: `Analyze this 2-minute single-player top-down spinning laser arena match and produce a punchy tactical scouting report.
 Arena: ${telemetry.arenaName}
 Laser Rig: ${telemetry.gunName} (${telemetry.shootingPointsCount} shooting points)
 Player stats: ${telemetry.kills} kills, ${telemetry.deaths} deaths, ${telemetry.shotsFired} laser pulses fired, ${telemetry.shotsHit} pulses hit (${accuracy}% pulse hit rate).
@@ -799,230 +679,9 @@ Standings: ${JSON.stringify(telemetry.players)}.`,
     }
   });
 
-  // --- HTTP + WebSocket Servers ---
+  // --- HTTP + Gemini Live Voice WebSocket Server ---
   const server = http.createServer(app);
-  const mpWss = new WebSocketServer({ noServer: true });
   const liveWss = new WebSocketServer({ noServer: true });
-
-  // Multiplayer WebRTC signaling + authoritative 4-player room sync
-  mpWss.on('connection', (ws) => {
-    const clientId = `p-${Math.random().toString(36).slice(2, 8)}`;
-    const meta: ClientMeta = { ws, id: clientId, roomCode: '' };
-
-    ws.on('message', (raw) => {
-      let msg: Record<string, unknown>;
-      try {
-        msg = JSON.parse(raw.toString());
-      } catch {
-        return;
-      }
-
-      const type = String(msg.type || '');
-
-      if (type === 'join_room' || type === 'create_room') {
-        if (meta.roomCode) removePlayerFromRoom(meta);
-
-        const requestedCode = String(msg.roomCode || '')
-          .toUpperCase()
-          .replace(/[^A-Z0-9]/g, '')
-          .slice(0, 6);
-        const code =
-          type === 'create_room' && !requestedCode
-            ? generateRoomCode()
-            : requestedCode || generateRoomCode();
-
-        let room = rooms.get(code);
-        if (!room) {
-          room = {
-            code,
-            hostId: clientId,
-            arena: (msg.arena as ArenaConfig) || createDefaultArenaConfig(),
-            matchState: 'lobby',
-            timeRemainingSec: MATCH_DURATION_SEC,
-            players: new Map(),
-            sockets: new Map(),
-            timerHandle: null,
-          };
-          rooms.set(code, room);
-        }
-
-        if (room.players.size >= MAX_PLAYERS_PER_ROOM) {
-          ws.send(JSON.stringify({ type: 'room_error', error: 'Room is full (max 4 players).' }));
-          return;
-        }
-
-        const usedSpawns = new Set(Array.from(room.players.values()).map((p) => p.spawnIndex));
-        let spawnIndex = 0;
-        while (usedSpawns.has(spawnIndex) && spawnIndex < MAX_PLAYERS_PER_ROOM) {
-          spawnIndex++;
-        }
-
-        const sp = room.arena.spawnPoints[spawnIndex % room.arena.spawnPoints.length];
-        const playerName = String(msg.playerName || `Pilot ${spawnIndex + 1}`).slice(0, 18);
-        const initialGun = msg.gun
-          ? sanitizeLaserGunConfig(msg.gun as Partial<LaserGunConfig>)
-          : createDefaultLaserGun();
-
-        const player: RoomPlayerState = {
-          id: clientId,
-          name: playerName,
-          spawnIndex,
-          color: sp.color,
-          x: sp.x,
-          y: 0,
-          z: sp.z,
-          yaw: sp.yaw,
-          pitch: 0,
-          hp: 100,
-          kills: 0,
-          deaths: 0,
-          weaponId: initialGun.id,
-          weaponName: initialGun.name,
-          gun: initialGun,
-          alive: true,
-        };
-
-        meta.roomCode = code;
-        room.players.set(clientId, player);
-        room.sockets.set(clientId, ws);
-
-        ws.send(
-          JSON.stringify({
-            type: 'room_joined',
-            selfId: clientId,
-            room: serializeRoom(room),
-          }),
-        );
-
-        broadcastToRoom(
-          room,
-          {
-            type: 'player_joined',
-            player,
-            players: Array.from(room.players.values()),
-          },
-          clientId,
-        );
-        return;
-      }
-
-      const room = rooms.get(meta.roomCode);
-      if (!room) return;
-
-      if (type === 'set_arena' && room.hostId === clientId && msg.arena) {
-        room.arena = msg.arena as ArenaConfig;
-        broadcastToRoom(room, { type: 'arena_updated', arena: room.arena });
-        return;
-      }
-
-      if (type === 'start_match') {
-        startRoomTimer(room);
-        return;
-      }
-
-      if (type === 'player_state') {
-        const p = room.players.get(clientId);
-        if (!p) return;
-        p.x = Number(msg.x) || 0;
-        p.y = 0;
-        p.z = Number(msg.z) || 0;
-        p.yaw = Number(msg.yaw) || 0;
-        if (typeof msg.weaponId === 'string') {
-          p.weaponId = msg.weaponId.slice(0, 40);
-        }
-        if (typeof msg.weaponName === 'string') {
-          p.weaponName = msg.weaponName.slice(0, 40);
-        }
-        if (msg.gun && typeof msg.gun === 'object') {
-          p.gun = sanitizeLaserGunConfig(msg.gun as Partial<LaserGunConfig>);
-        }
-
-        broadcastToRoom(
-          room,
-          {
-            type: 'remote_state',
-            id: clientId,
-            x: p.x,
-            y: 0,
-            z: p.z,
-            yaw: p.yaw,
-            pitch: 0,
-            weaponId: p.weaponId,
-            weaponName: p.weaponName,
-            gun: p.gun,
-          },
-          clientId,
-        );
-        return;
-      }
-
-      if (type === 'fire_shot') {
-        broadcastToRoom(
-          room,
-          {
-            type: 'remote_shot',
-            id: clientId,
-            pulses: Array.isArray(msg.pulses) ? msg.pulses : [],
-          },
-          clientId,
-        );
-        return;
-      }
-
-      if (type === 'hit_player') {
-        const targetId = String(msg.targetId || '');
-        const damage = Math.max(1, Math.min(100, Number(msg.damage) || 30));
-        const weaponName = String(msg.weaponName || 'Laser Pulse').slice(0, 40);
-        const victim = room.players.get(targetId);
-        const killer = room.players.get(clientId);
-        if (!victim || !killer || targetId === clientId) return;
-
-        const result = applyDamageAndRespawn(victim, damage, room.arena.spawnPoints);
-        room.players.set(targetId, result.respawnedPlayer);
-
-        if (result.killed) {
-          killer.kills += 1;
-          room.players.set(clientId, killer);
-          broadcastToRoom(room, {
-            type: 'player_eliminated',
-            killerId: clientId,
-            killerName: killer.name,
-            victimId: targetId,
-            victimName: victim.name,
-            weaponName,
-            respawnedVictim: result.respawnedPlayer,
-            players: Array.from(room.players.values()),
-          });
-        } else {
-          broadcastToRoom(room, {
-            type: 'player_damaged',
-            targetId,
-            hp: result.respawnedPlayer.hp,
-            attackerId: clientId,
-          });
-        }
-        return;
-      }
-
-      if (type === 'rtc_signal') {
-        const targetId = String(msg.targetId || '');
-        const targetSock = room.sockets.get(targetId);
-        if (targetSock && targetSock.readyState === WebSocket.OPEN) {
-          targetSock.send(
-            JSON.stringify({
-              type: 'rtc_signal',
-              fromId: clientId,
-              signal: msg.signal,
-            }),
-          );
-        }
-      }
-    });
-
-    ws.on('close', () => {
-      removePlayerFromRoom(meta);
-    });
-  });
 
   // Gemini Live API Voice Command Bridge (/ws/live using gemini-3.8-live)
   liveWss.on('connection', async (clientWs) => {
@@ -1085,7 +744,7 @@ Standings: ${JSON.stringify(telemetry.players)}.`,
     const connectWithApiVersion = async (apiVersion: 'v1alpha' | 'v1beta') => {
       const ai = getAiClient(apiVersion);
       return ai.live.connect({
-        model: 'gemini-3.8-live',
+        model: MODEL_IDS.live_voice_vision,
         config: {
           responseModalities: [Modality.AUDIO],
           inputAudioTranscription: {},
@@ -1238,9 +897,7 @@ Respond with a crisp 1-2 word confirmation.`,
 
     server.on('upgrade', (req, socket, head) => {
       const pathname = (req.url || '').split('?')[0];
-      if (pathname === '/ws/multiplayer') {
-        mpWss.handleUpgrade(req, socket, head, (ws) => mpWss.emit('connection', ws, req));
-      } else if (pathname === '/ws/live') {
+      if (pathname === '/ws/live') {
         liveWss.handleUpgrade(req, socket, head, (ws) => liveWss.emit('connection', ws, req));
       }
     });
@@ -1258,9 +915,7 @@ Respond with a crisp 1-2 word confirmation.`,
 
     server.on('upgrade', (req, socket, head) => {
       const pathname = (req.url || '').split('?')[0];
-      if (pathname === '/ws/multiplayer') {
-        mpWss.handleUpgrade(req, socket, head, (ws) => mpWss.emit('connection', ws, req));
-      } else if (pathname === '/ws/live') {
+      if (pathname === '/ws/live') {
         liveWss.handleUpgrade(req, socket, head, (ws) => liveWss.emit('connection', ws, req));
       } else {
         socket.destroy();

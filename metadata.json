@@ -1,6 +1,6 @@
 {
   "name": "Laser Palm",
-  "description": "Laser Palm: Top-down hand-tracked 4-player spinning laser arena with webcam face avatars, AI gun & polygon level generation, and Nano Banana textures.",
+  "description": "Laser Palm: Single-player top-down hand-tracked spinning laser arena with webcam face avatars, AI gun & polygon level generation, and Nano Banana textures.",
   "requestFramePermissions": [
     "camera",
     "microphone"

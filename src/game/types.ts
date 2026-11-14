@@ -184,7 +184,7 @@ export interface KillFeedItem {
 }
 
 export interface MatchTelemetry {
-  roomCode: string;
+  botsEnabled: boolean;
   arenaName: string;
   gunName: string;
   shootingPointsCount: number;

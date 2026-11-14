@@ -9,7 +9,6 @@ import type {
 } from './types';
 
 export const MATCH_DURATION_SEC = 120;
-export const MAX_PLAYERS_PER_ROOM = 4;
 export const PLAYER_RADIUS = 0.82;
 export const MOVE_SPEED = 8.4;
 export const DEFAULT_SPIN_SPEED = 0.95; // rad/s — deliberate, smooth continuous spin

@@ -25,11 +25,9 @@ import type {
   LaserGunConfig,
   LaserPulsePath,
   PlayerHudState,
-  RoomPlayerState,
   Vec2,
   VoiceActionType,
 } from './types';
-import type { RemoteStatePayload } from '../net/multiplayerClient';
 
 interface ActivePulseVisual {
   points: Vec2[];
@@ -83,9 +81,6 @@ export interface TopDownEngineCallbacks {
   onPulseAccepted?: () => void;
   onBotKill: (victimName: string, weaponName: string) => void;
   onBotKilledSelf?: (botName: string, weaponName: string) => void;
-  onRemoteHit: (targetId: string, damage: number, weaponName: string) => void;
-  onBroadcastState: (state: Omit<RemoteStatePayload, 'id'>) => void;
-  onBroadcastShot: (pulses: LaserPulsePath[]) => void;
   onGunChanged?: (gun: LaserGunConfig) => void;
   onPauseToggle: () => void;
 }
@@ -152,8 +147,7 @@ export class TopDownArenaEngine {
   private activeRightGesture: GestureName = 'NONE';
   private handMoveVec: Vec2 = { x: 0, z: 0 };
 
-  // Opponents: Multiplayer remote players + 3 distinct AI bots
-  private remotePlayers = new Map<string, RoomPlayerState>();
+  // Single-player opponents: 3 distinct AI bot archetypes
   private botsEnabled = true;
   private bots: BotActor[] = [];
 
@@ -166,7 +160,6 @@ export class TopDownArenaEngine {
   private rafId = 0;
   private lastFrameMs = 0;
   private lastHudPushMs = 0;
-  private lastNetSyncMs = 0;
 
   constructor(
     mountEl: HTMLElement,
@@ -387,15 +380,12 @@ export class TopDownArenaEngine {
   }
 
   private rebuildBots() {
-    if (!this.botsEnabled || this.remotePlayers.size >= 3) {
+    if (!this.botsEnabled) {
       this.bots = [];
       return;
     }
 
     const occupiedSpawns = new Set<number>([this.spawnIndex]);
-    for (const rp of this.remotePlayers.values()) {
-      occupiedSpawns.add(rp.spawnIndex);
-    }
 
     // 3 genuinely distinct enemy archetypes, silhouettes, loadouts & movement policies!
     const specs: Array<{
@@ -462,79 +452,6 @@ export class TopDownArenaEngine {
       });
     }
     this.bots = nextBots;
-  }
-
-  public syncRemotePlayers(players: RoomPlayerState[]) {
-    const next = new Map<string, RoomPlayerState>();
-    for (const p of players) {
-      if (p.id === this.selfId) {
-        this.spawnIndex = p.spawnIndex;
-        continue;
-      }
-      next.set(p.id, { ...p });
-    }
-    this.remotePlayers = next;
-    this.rebuildBots();
-  }
-
-  public applyRemoteStateDelta(delta: RemoteStatePayload) {
-    if (delta.id === this.selfId) return;
-    const existing = this.remotePlayers.get(delta.id);
-    if (existing) {
-      existing.x = delta.x;
-      existing.z = delta.z;
-      existing.yaw = delta.yaw;
-      if (delta.gun) existing.gun = delta.gun;
-      if (delta.weaponName) existing.weaponName = delta.weaponName;
-    }
-  }
-
-  public spawnRemotePulses(pulses: LaserPulsePath[]) {
-    for (const p of pulses) {
-      if (!p.points || p.points.length < 2) continue;
-      this.activePulses.push({
-        points: p.points,
-        color: p.color || '#f59e0b',
-        impactPoint: p.impactPoint,
-        age: 0,
-        duration: 0.28,
-      });
-      if (p.impactPoint) {
-        this.spawnImpactParticles(p.impactPoint.x, p.impactPoint.z, p.color || '#f59e0b', 8);
-      }
-    }
-    sfx.playLaserPulse(pulses.length, false);
-  }
-
-  public applyRemoteDamageToSelf(nextHp: number) {
-    if (nextHp < this.hp) {
-      this.damageFlashTimer = 0.22;
-      this.selfHitFlashTimer = 0.08;
-      this.cameraTrauma = Math.min(1, this.cameraTrauma + 0.35);
-      sfx.playHurt();
-    }
-    this.hp = Math.max(0, nextHp);
-    this.emitHudSnapshot(true);
-  }
-
-  public handleEliminationEvent(data: {
-    killerId: string;
-    victimId: string;
-    respawnedVictim: RoomPlayerState;
-  }) {
-    if (data.killerId === this.selfId) {
-      this.kills += 1;
-      this.hitmarkerTimer = 0.24;
-      this.hitstopTimer = 0.05;
-      sfx.playHitmarker(true);
-    }
-    if (data.victimId === this.selfId) {
-      this.deaths += 1;
-      this.respawnSelfAtCorner(this.spawnIndex);
-      this.damageFlashTimer = 0.32;
-      sfx.playHurt();
-    }
-    this.emitHudSnapshot(true);
   }
 
   public setTimeRemaining(sec: number) {
@@ -682,11 +599,6 @@ export class TopDownArenaEngine {
     for (const b of this.bots) {
       targets.push({ id: b.id, x: b.x, z: b.z, radius: PLAYER_RADIUS });
     }
-    for (const rp of this.remotePlayers.values()) {
-      if (rp.alive) {
-        targets.push({ id: rp.id, x: rp.x, z: rp.z, radius: PLAYER_RADIUS });
-      }
-    }
 
     const liveBeams: LaserPulsePath[] = [];
     const newlyHitTargets = new Map<string, number>();
@@ -778,8 +690,6 @@ export class TopDownArenaEngine {
             this.spawnImpactParticles(safeSp.x, safeSp.z, bot.color, 20);
             this.callbacks.onBotKill(bot.name, this.gun.name);
           }
-        } else if (this.remotePlayers.has(tid)) {
-          this.callbacks.onRemoteHit(tid, dmg, this.gun.name);
         }
       }
 
@@ -789,10 +699,6 @@ export class TopDownArenaEngine {
       }
       sfx.playHitmarker(anyKilled);
       this.emitHudSnapshot(true);
-    }
-
-    if (emitAfterglowRibbon) {
-      this.callbacks.onBroadcastShot(liveBeams);
     }
   }
 
@@ -1127,22 +1033,8 @@ export class TopDownArenaEngine {
     this.camCenter.x += (targetCamX - this.camCenter.x) * damp;
     this.camCenter.z += (targetCamZ - this.camCenter.z) * damp;
 
-    // 7. Broadcast multiplayer state (~20Hz) & throttled React HUD updates (~15Hz)
+    // 7. Throttled React HUD updates (~15Hz)
     const now = performance.now();
-    if (now - this.lastNetSyncMs >= 50) {
-      this.lastNetSyncMs = now;
-      this.callbacks.onBroadcastState({
-        x: Number(this.pos.x.toFixed(2)),
-        y: 0,
-        z: Number(this.pos.z.toFixed(2)),
-        yaw: Number(this.spinAngle.toFixed(3)),
-        pitch: 0,
-        weaponId: this.gun.id,
-        weaponName: this.gun.name,
-        gun: this.gun,
-      });
-    }
-
     if (now - this.lastHudPushMs >= 65) {
       this.emitHudSnapshot(false);
     }
@@ -1377,25 +1269,6 @@ export class TopDownArenaEngine {
           label: bot.name.replace(' (Bot)', ''),
           isSelf: false,
           archetype: bot.archetype,
-        });
-      }
-
-      // Draw Remote Multiplayer Peers
-      for (const rp of this.remotePlayers.values()) {
-        if (!rp.alive) continue;
-        const rGun = rp.gun || createDefaultLaserGun();
-        this.drawSpinningCircleActor(ctx, {
-          x: rp.x,
-          z: rp.z,
-          spinAngle: rp.yaw,
-          color: rp.color,
-          gun: rGun,
-          hpRatio: rp.hp / 100,
-          cooldownRatio: 0,
-          telegraphRatio: 0,
-          hitFlash: false,
-          label: rp.name,
-          isSelf: false,
         });
       }
 

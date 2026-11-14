@@ -32,7 +32,6 @@ import type {
   RoomPlayerState,
 } from './game/types';
 import { LiveVoiceClient } from './net/liveVoiceClient';
-import { MultiplayerClient } from './net/multiplayerClient';
 import { OnDeviceHandTracker } from './vision/handTracker';
 
 const DEFAULT_GUN = createDefaultLaserGun();
@@ -64,7 +63,6 @@ export default function App() {
 
   const engineRef = useRef<TopDownArenaEngine | null>(null);
   const handTrackerRef = useRef<OnDeviceHandTracker | null>(null);
-  const mpClientRef = useRef<MultiplayerClient | null>(null);
   const voiceClientRef = useRef<LiveVoiceClient | null>(null);
   const soloTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -83,17 +81,12 @@ export default function App() {
 
   const [hud, setHud] = useState<PlayerHudState>(INITIAL_HUD);
   const [playerName, setPlayerName] = useState('Pilot 1');
-  const [roomCodeInput, setRoomCodeInput] = useState(() => {
-    const params = new URLSearchParams(window.location.search);
-    return (params.get('room') || '').toUpperCase();
-  });
-  const [activeRoomCode, setActiveRoomCode] = useState('');
-  const [hostId, setHostId] = useState('');
-  const [selfId, setSelfId] = useState('local');
+  const selfId = 'local';
   const [players, setPlayers] = useState<RoomPlayerState[]>([]);
-  const [webrtcPeers, setWebrtcPeers] = useState(0);
   const [killFeed, setKillFeed] = useState<KillFeedItem[]>([]);
   const [botsEnabled, setBotsEnabled] = useState(true);
+  const botsEnabledRef = useRef(true);
+  botsEnabledRef.current = botsEnabled;
 
   const [muted, setMuted] = useState(false);
   const [cameraActive, setCameraActive] = useState(false);
@@ -109,8 +102,6 @@ export default function App() {
   } | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
 
-  const activeRoomRef = useRef('');
-  activeRoomRef.current = activeRoomCode;
   const playerNameRef = useRef(playerName);
   playerNameRef.current = playerName;
 
@@ -151,142 +142,131 @@ export default function App() {
     ]);
   }, []);
 
-  const finalizeMatch = useCallback(
-    async (finalPlayers?: RoomPlayerState[]) => {
-      if (soloTimerRef.current) {
-        clearInterval(soloTimerRef.current);
-        soloTimerRef.current = null;
-      }
+  const finalizeMatch = useCallback(async () => {
+    if (soloTimerRef.current) {
+      clearInterval(soloTimerRef.current);
+      soloTimerRef.current = null;
+    }
 
-      phaseRef.current = 'gameover';
-      setPhase('gameover');
-      document.body.dataset.state = 'gameover';
-      engineRef.current?.setPhase('gameover');
-      void triggerTtsAnnouncement('Match complete! Standings locked.');
+    phaseRef.current = 'gameover';
+    setPhase('gameover');
+    document.body.dataset.state = 'gameover';
+    engineRef.current?.setPhase('gameover');
+    void triggerTtsAnnouncement('Match complete! Standings locked.');
 
-      const engineStats = engineRef.current?.getTelemetrySnapshot() ?? {
-        kills: hud.kills,
-        deaths: hud.deaths,
-        shotsFired: 0,
-        shotsHit: 0,
-        gestureCounts: {},
-        voiceCommandsCount: 0,
-        botStandings: [],
-      };
+    const engineStats = engineRef.current?.getTelemetrySnapshot() ?? {
+      kills: hud.kills,
+      deaths: hud.deaths,
+      shotsFired: 0,
+      shotsHit: 0,
+      gestureCounts: {},
+      voiceCommandsCount: 0,
+      botStandings: [],
+    };
 
-      const roster: RoomPlayerState[] =
-        finalPlayers && finalPlayers.length > 0
-          ? finalPlayers
-          : [
-              {
-                id: selfId,
-                name: playerNameRef.current,
-                spawnIndex: 0,
-                color: '#38bdf8',
-                x: 0,
-                y: 0,
-                z: 0,
-                yaw: 0,
-                pitch: 0,
-                hp: 100,
-                kills: engineStats.kills,
-                deaths: engineStats.deaths,
-                weaponId: gunRef.current.id,
-                weaponName: gunRef.current.name,
-                alive: true,
-              },
-              ...engineStats.botStandings,
-            ];
-
-      setPlayers(roster);
-
-      const standings = roster.map((p) => ({
-        name: p.name,
-        kills: p.id === selfId ? engineStats.kills : p.kills,
-        deaths: p.id === selfId ? engineStats.deaths : p.deaths,
-        isSelf: p.id === selfId,
-        isBot: p.isBot,
-      }));
-
-      const telemetry: MatchTelemetry = {
-        roomCode: activeRoomRef.current || 'SOLO',
-        arenaName: arenaRef.current.name,
-        gunName: gunRef.current.name,
-        shootingPointsCount: gunRef.current.shootingPoints.length,
-        durationSec: MATCH_DURATION_SEC,
+    const roster: RoomPlayerState[] = [
+      {
+        id: selfId,
+        name: playerNameRef.current,
+        spawnIndex: 0,
+        color: '#38bdf8',
+        x: 0,
+        y: 0,
+        z: 0,
+        yaw: 0,
+        pitch: 0,
+        hp: 100,
         kills: engineStats.kills,
         deaths: engineStats.deaths,
-        shotsFired: engineStats.shotsFired,
-        shotsHit: engineStats.shotsHit,
-        gestureCounts: engineStats.gestureCounts,
-        voiceCommandsCount: engineStats.voiceCommandsCount,
-        players: standings,
-      };
-      setEndTelemetry(telemetry);
-      setReportLoading(true);
-      setReport(null);
+        weaponId: gunRef.current.id,
+        weaponName: gunRef.current.name,
+        alive: true,
+      },
+      ...engineStats.botStandings,
+    ];
 
-      try {
-        const res = await fetch('/api/gemini/report', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ telemetry }),
-        });
-        if (res.ok) {
-          const data = await res.json();
-          setReport(data);
-        }
-      } catch {
-        // Fallback summary handled inside StatusModal
-      } finally {
-        setReportLoading(false);
+    setPlayers(roster);
+
+    const standings = roster.map((p) => ({
+      name: p.name,
+      kills: p.id === selfId ? engineStats.kills : p.kills,
+      deaths: p.id === selfId ? engineStats.deaths : p.deaths,
+      isSelf: p.id === selfId,
+      isBot: p.isBot,
+    }));
+
+    const telemetry: MatchTelemetry = {
+      botsEnabled: botsEnabledRef.current,
+      arenaName: arenaRef.current.name,
+      gunName: gunRef.current.name,
+      shootingPointsCount: gunRef.current.shootingPoints.length,
+      durationSec: MATCH_DURATION_SEC,
+      kills: engineStats.kills,
+      deaths: engineStats.deaths,
+      shotsFired: engineStats.shotsFired,
+      shotsHit: engineStats.shotsHit,
+      gestureCounts: engineStats.gestureCounts,
+      voiceCommandsCount: engineStats.voiceCommandsCount,
+      players: standings,
+    };
+    setEndTelemetry(telemetry);
+    setReportLoading(true);
+    setReport(null);
+
+    try {
+      const res = await fetch('/api/gemini/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ telemetry }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setReport(data);
       }
-    },
-    [hud.deaths, hud.kills, selfId, triggerTtsAnnouncement],
-  );
+    } catch {
+      // Fallback summary handled inside StatusModal
+    } finally {
+      setReportLoading(false);
+    }
+  }, [hud.deaths, hud.kills, triggerTtsAnnouncement]);
 
-  const enterPlayingPhase = useCallback(
-    (isMultiplayerMatch: boolean) => {
-      if (document.activeElement instanceof HTMLElement) {
-        document.activeElement.blur();
+  const enterPlayingPhase = useCallback(() => {
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+    if (soloTimerRef.current) {
+      clearInterval(soloTimerRef.current);
+      soloTimerRef.current = null;
+    }
+
+    setKillFeed([]);
+    setReport(null);
+    setEndTelemetry(null);
+    phaseRef.current = 'playing';
+    resumePhaseRef.current = 'playing';
+    setPhase('playing');
+    document.body.dataset.state = 'playing';
+
+    engineRef.current?.resetMatchStats();
+    engineRef.current?.setPhase('playing');
+    sfx.playCountdownBeep(true);
+    void triggerTtsAnnouncement('Spin emitters live! Two minutes on the clock.');
+
+    let sec = MATCH_DURATION_SEC;
+    engineRef.current?.setTimeRemaining(sec);
+    soloTimerRef.current = setInterval(() => {
+      if (phaseRef.current !== 'playing') return;
+      sec = Math.max(0, sec - 1);
+      engineRef.current?.setTimeRemaining(sec);
+      if (sec === 30) {
+        sfx.playCountdownBeep(false);
+        void triggerTtsAnnouncement('Thirty seconds remaining!');
       }
-      if (soloTimerRef.current) {
-        clearInterval(soloTimerRef.current);
-        soloTimerRef.current = null;
+      if (sec <= 0) {
+        void finalizeMatch();
       }
-
-      setKillFeed([]);
-      setReport(null);
-      setEndTelemetry(null);
-      phaseRef.current = 'playing';
-      resumePhaseRef.current = 'playing';
-      setPhase('playing');
-      document.body.dataset.state = 'playing';
-
-      engineRef.current?.resetMatchStats();
-      engineRef.current?.setPhase('playing');
-      sfx.playCountdownBeep(true);
-      void triggerTtsAnnouncement('Spin emitters live! Two minutes on the clock.');
-
-      if (!isMultiplayerMatch) {
-        let sec = MATCH_DURATION_SEC;
-        engineRef.current?.setTimeRemaining(sec);
-        soloTimerRef.current = setInterval(() => {
-          if (phaseRef.current !== 'playing') return;
-          sec = Math.max(0, sec - 1);
-          engineRef.current?.setTimeRemaining(sec);
-          if (sec === 30) {
-            sfx.playCountdownBeep(false);
-            void triggerTtsAnnouncement('Thirty seconds remaining!');
-          }
-          if (sec <= 0) {
-            void finalizeMatch();
-          }
-        }, 1000);
-      }
-    },
-    [finalizeMatch, triggerTtsAnnouncement],
-  );
+    }, 1000);
+  }, [finalizeMatch, triggerTtsAnnouncement]);
 
   const enterTutorialPhase = useCallback(() => {
     if (document.activeElement instanceof HTMLElement) {
@@ -358,19 +338,6 @@ export default function App() {
       onBotKilledSelf: (botName, weaponName) => {
         pushKillFeed(botName, playerNameRef.current, weaponName);
       },
-      onRemoteHit: (targetId, damage, weaponName) => {
-        mpClientRef.current?.sendHitPlayer(targetId, damage, weaponName);
-      },
-      onBroadcastState: (state) => {
-        if (activeRoomRef.current) {
-          mpClientRef.current?.sendPlayerState(state);
-        }
-      },
-      onBroadcastShot: (pulses) => {
-        if (activeRoomRef.current) {
-          mpClientRef.current?.sendShot(pulses);
-        }
-      },
       onGunChanged: (nextGun) => {
         setGun(nextGun);
         gunRef.current = nextGun;
@@ -393,83 +360,6 @@ export default function App() {
     });
     engine.setFaceCutoutProvider(() => tracker.getFaceCutoutCanvas());
     engineRef.current = engine;
-
-    const mp = new MultiplayerClient({
-      onRoomJoined: (data) => {
-        setActiveRoomCode(data.code);
-        setRoomCodeInput(data.code);
-        setHostId(data.hostId);
-        setSelfId(data.selfId);
-        setPlayers(data.players);
-        setArena(data.arena);
-        arenaRef.current = data.arena;
-        engine.setArena(data.arena);
-        const me = data.players.find((p) => p.id === data.selfId);
-        engine.setSelfIdentity(data.selfId, me?.spawnIndex ?? 0);
-        engine.syncRemotePlayers(data.players);
-        if (data.matchState === 'playing') {
-          engine.setTimeRemaining(data.timeRemainingSec);
-          enterPlayingPhase(true);
-        }
-      },
-      onPlayersUpdated: (nextPlayers, nextHostId) => {
-        setPlayers(nextPlayers);
-        if (nextHostId) setHostId(nextHostId);
-        engine.syncRemotePlayers(nextPlayers);
-      },
-      onArenaUpdated: (nextArena) => {
-        setArena(nextArena);
-        arenaRef.current = nextArena;
-        engine.setArena(nextArena);
-      },
-      onMatchStarted: (data) => {
-        setArena(data.arena);
-        arenaRef.current = data.arena;
-        setPlayers(data.players);
-        engine.setArena(data.arena);
-        engine.syncRemotePlayers(data.players);
-        engine.setTimeRemaining(data.timeRemainingSec);
-        enterPlayingPhase(true);
-      },
-      onTimerTick: (sec) => {
-        engine.setTimeRemaining(sec);
-        if (sec === 30) {
-          sfx.playCountdownBeep(false);
-          void triggerTtsAnnouncement('Thirty seconds remaining!');
-        }
-      },
-      onMatchEnded: (finalPlayers) => {
-        setPlayers(finalPlayers);
-        void finalizeMatch(finalPlayers);
-      },
-      onRemoteState: (delta) => {
-        engine.applyRemoteStateDelta(delta);
-      },
-      onRemoteShot: (shot) => {
-        engine.spawnRemotePulses(shot.pulses);
-      },
-      onPlayerDamaged: (data) => {
-        if (data.targetId === mp.getSelfId()) {
-          engine.applyRemoteDamageToSelf(data.hp);
-        }
-      },
-      onPlayerEliminated: (data) => {
-        setPlayers(data.players);
-        engine.syncRemotePlayers(data.players);
-        engine.handleEliminationEvent(data);
-        pushKillFeed(data.killerName, data.victimName, data.weaponName);
-        if (data.killerId === mp.getSelfId()) {
-          void triggerTtsAnnouncement('Elimination confirmed!');
-        }
-      },
-      onError: (message) => {
-        setVoiceError(message);
-      },
-      onPeerCountChange: (count) => {
-        setWebrtcPeers(count);
-      },
-    });
-    mpClientRef.current = mp;
 
     const voice = new LiveVoiceClient({
       onStatusChange: (status, msg) => {
@@ -497,24 +387,15 @@ export default function App() {
 
     const params = new URLSearchParams(window.location.search);
     if (params.get('autostart') === '1') {
-      enterPlayingPhase(false);
+      enterPlayingPhase();
     } else if (params.get('tutorial') === '1') {
       enterTutorialPhase();
-    } else if (params.get('room')) {
-      const code = params.get('room')!.toUpperCase();
-      void mp.createOrJoinRoom({
-        mode: 'join',
-        roomCode: code,
-        playerName: 'Pilot',
-        gun: gunRef.current,
-      });
     }
 
     return () => {
       if (soloTimerRef.current) clearInterval(soloTimerRef.current);
       tracker.stop();
       voice.stop();
-      mp.disconnect();
       engine.dispose();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -530,11 +411,7 @@ export default function App() {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       if (e.code === 'Enter' || e.code === 'Space') {
         e.preventDefault();
-        if (activeRoomRef.current) {
-          mpClientRef.current?.startMatch();
-        } else {
-          enterPlayingPhase(false);
-        }
+        enterPlayingPhase();
       }
     };
     window.addEventListener('keydown', onTitleKey);
@@ -644,25 +521,6 @@ export default function App() {
     return recorded;
   };
 
-  const handleCreateRoom = async () => {
-    await mpClientRef.current?.createOrJoinRoom({
-      mode: 'create',
-      playerName: playerName.trim() || 'Pilot 1',
-      arena: arenaRef.current,
-      gun: gunRef.current,
-    });
-  };
-
-  const handleJoinRoom = async () => {
-    if (!roomCodeInput.trim()) return;
-    await mpClientRef.current?.createOrJoinRoom({
-      mode: 'join',
-      roomCode: roomCodeInput.trim(),
-      playerName: playerName.trim() || 'Pilot',
-      gun: gunRef.current,
-    });
-  };
-
   const handleGenerateArena = async (
     theme: string,
     options?: { generateTextures?: boolean; randomShape?: boolean },
@@ -691,18 +549,11 @@ export default function App() {
     setArena(nextArena);
     arenaRef.current = nextArena;
     engineRef.current?.setArena(nextArena);
-    if (activeRoomCode && hostId === selfId) {
-      mpClientRef.current?.sendArenaUpdate(nextArena);
-    }
     return data.textureWarning as string | undefined;
   };
 
   const handleStartOrRestart = () => {
-    if (activeRoomCode) {
-      mpClientRef.current?.startMatch();
-    } else {
-      enterPlayingPhase(false);
-    }
+    enterPlayingPhase();
   };
 
   const handleResume = () => {
@@ -757,11 +608,6 @@ export default function App() {
         <TitleOverlay
           playerName={playerName}
           onPlayerNameChange={setPlayerName}
-          roomCodeInput={roomCodeInput}
-          onRoomCodeInputChange={setRoomCodeInput}
-          activeRoomCode={activeRoomCode}
-          players={players}
-          isHost={!activeRoomCode || hostId === selfId}
           arena={arena}
           gun={gun}
           shootGesture={shootGesture}
@@ -776,8 +622,6 @@ export default function App() {
           onDescribeAiGesture={handleDescribeAiGesture}
           onRecordLiveGesture={handleRecordLiveGesture}
           onToggleBots={handleToggleBots}
-          onCreateRoom={handleCreateRoom}
-          onJoinRoom={handleJoinRoom}
           onToggleCamera={handleToggleCamera}
           onToggleSwapHands={handleToggleSwapHands}
           onToggleVoice={handleToggleVoice}
@@ -793,9 +637,7 @@ export default function App() {
           phase={phase}
           hud={hud}
           tutorial={tutorial}
-          roomCode={activeRoomCode}
-          playerCount={players.length}
-          webrtcPeers={webrtcPeers}
+          botsEnabled={botsEnabled}
           killFeed={killFeed}
           muted={muted}
           cameraActive={cameraActive}
